@@ -18,13 +18,13 @@ It reads `getClusterNodes`, filters nodes whose advertised `rpc` field ends with
 Linux/macOS:
 
 ```bash
-bin/probe.sh --cluster-rpc http://45.152.160.99:8899 --grpc-h2c
+bin/probe.sh --cluster-rpc http://YOUR_RPC_HOST:8899 --grpc-h2c
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\bin\probe.ps1 --cluster-rpc http://45.152.160.99:8899 --grpc-h2c
+.\bin\probe.ps1 --cluster-rpc http://YOUR_RPC_HOST:8899 --grpc-h2c
 ```
 
 Direct Python:
@@ -51,7 +51,7 @@ python3 bin/solana-validator-rpc-health.py --cluster-rpc https://api.mainnet-bet
 Environment variables are also supported:
 
 ```bash
-CLUSTER_RPC=http://45.152.160.99:8899 \
+CLUSTER_RPC=http://YOUR_RPC_HOST:8899 \
 TIMEOUT_SECONDS=1.5 \
 MAX_PARALLEL=64 \
 GRPC_PORT=10000 \
