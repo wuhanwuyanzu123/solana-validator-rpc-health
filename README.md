@@ -2,12 +2,14 @@
 
 Small CLI for probing Solana validator-advertised RPC endpoints.
 
-It reads `getClusterNodes`, filters nodes whose advertised `rpc` field ends with `:8899`, then checks common RPC methods and optionally probes the same host's gRPC port, usually `:10000`.
+It reads `getClusterNodes`, filters nodes whose advertised `rpc` field ends with `:8899` by default, then checks common RPC methods and optionally probes `getMultipleAccounts` plus the same host's gRPC port, usually `:10000`.
 
 ## Features
 
 - Discovers advertised validator RPC endpoints from any Solana RPC.
 - Checks `getHealth`, `getVersion`, `getSlot`, `getBlockHeight`, `getLatestBlockhash`, and `getGenesisHash`.
+- Optionally checks `getMultipleAccounts` for a supplied account pubkey, including 64-character hex input.
+- Can probe all advertised RPC endpoints, not only `:8899`.
 - Measures RPC latency and writes a CSV report.
 - Probes gRPC TCP reachability on the same host and port.
 - Optional h2c gRPC check through `curl --http2-prior-knowledge`, useful for seeing responses like `grpc-status=16 grpc-message=No valid auth token`.
@@ -38,6 +40,11 @@ python3 bin/solana-validator-rpc-health.py --cluster-rpc https://api.mainnet-bet
 ```text
 --cluster-rpc URL       RPC used for getClusterNodes
 --rpc-suffix :8899      Advertised RPC suffix to filter
+--all-advertised-rpc    Probe every advertised RPC endpoint instead of filtering by suffix
+--get-multiple-accounts ACCOUNT
+                         Probe getMultipleAccounts for this pubkey; 64-char hex is converted to base58
+--account-encoding base64
+                         Account encoding used for getMultipleAccounts
 --timeout 2             Per-RPC request timeout in seconds
 --parallel 48           Concurrent RPC probes
 --print-first 50        Rows printed per section

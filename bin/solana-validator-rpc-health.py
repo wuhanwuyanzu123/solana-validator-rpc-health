@@ -8,6 +8,7 @@ import concurrent.futures
 import csv
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,7 @@ from urllib import request
 
 
 MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 @dataclass
@@ -35,6 +37,9 @@ class ProbeResult:
     latest_blockhash_ok: bool
     genesis_hash: str
     genesis_ok: bool
+    get_multiple_accounts_ok: bool
+    get_multiple_accounts_latency_ms: int | str
+    get_multiple_accounts_error: str
     grpc_host: str
     grpc_port: int
     grpc_tcp_open: bool
@@ -47,6 +52,19 @@ class ProbeResult:
     error: str
 
 
+def normalize_pubkey(value: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raw = bytes.fromhex(value)
+        number = int.from_bytes(raw, "big")
+        encoded = ""
+        while number:
+            number, remainder = divmod(number, 58)
+            encoded = BASE58_ALPHABET[remainder] + encoded
+        zero_prefix = len(raw) - len(raw.lstrip(b"\0"))
+        return "1" * zero_prefix + (encoded or "1")
+    return value
+
+
 def rpc_post(url: str, method: str, timeout: float, params: list[Any] | None = None) -> tuple[dict[str, Any], int]:
     payload: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
@@ -56,7 +74,7 @@ def rpc_post(url: str, method: str, timeout: float, params: list[Any] | None = N
     req = request.Request(
         url,
         data=data,
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "user-agent": "curl/8.0"},
         method="POST",
     )
     start = time.perf_counter()
@@ -130,6 +148,9 @@ def probe_node(node: dict[str, Any], args: argparse.Namespace) -> ProbeResult:
         latest_blockhash_ok=False,
         genesis_hash="",
         genesis_ok=False,
+        get_multiple_accounts_ok=False,
+        get_multiple_accounts_latency_ms="",
+        get_multiple_accounts_error="",
         grpc_host=host,
         grpc_port=args.grpc_port,
         grpc_tcp_open=False,
@@ -162,6 +183,18 @@ def probe_node(node: dict[str, Any], args: argparse.Namespace) -> ProbeResult:
         genesis, _ = rpc_post(rpc_url, "getGenesisHash", args.timeout)
         row.genesis_hash = genesis.get("result") or ""
         row.genesis_ok = row.genesis_hash == args.expected_genesis_hash
+
+        if args.get_multiple_accounts:
+            account_params = [[args.get_multiple_accounts], {"encoding": args.account_encoding}]
+            accounts, accounts_latency_ms = rpc_post(rpc_url, "getMultipleAccounts", args.timeout, account_params)
+            row.get_multiple_accounts_latency_ms = accounts_latency_ms
+            if "error" in accounts:
+                row.get_multiple_accounts_error = json.dumps(accounts["error"], separators=(",", ":"))
+            else:
+                value = (accounts.get("result") or {}).get("value")
+                row.get_multiple_accounts_ok = isinstance(value, list) and len(value) == 1
+                if not row.get_multiple_accounts_ok:
+                    row.get_multiple_accounts_error = json.dumps(accounts, separators=(",", ":"))
 
         row.ok = bool(row.node_version or row.slot)
     except Exception as exc:
@@ -197,9 +230,14 @@ def print_table(title: str, rows: list[ProbeResult], limit: int) -> None:
             grpc = f" grpc{row.grpc_port}=open/{row.grpc_tcp_latency_ms}ms"
             if row.grpc_h2c_status:
                 grpc += f" h2c={row.grpc_h2c_status}"
+        accounts = ""
+        if row.get_multiple_accounts_ok:
+            accounts = f" getMultipleAccounts={row.get_multiple_accounts_latency_ms}ms"
+        elif row.get_multiple_accounts_error:
+            accounts = f" getMultipleAccountsError={row.get_multiple_accounts_error[:80]}"
         print(
             f"{row.rpc:<22} rpc={row.rpc_latency_ms}ms health={row.health} "
-            f"slot={row.slot} ver={row.node_version}{grpc} pubkey={row.pubkey}"
+            f"slot={row.slot} ver={row.node_version}{accounts}{grpc} pubkey={row.pubkey}"
         )
 
 
@@ -207,35 +245,47 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cluster-rpc", default=os.environ.get("CLUSTER_RPC", "https://api.mainnet-beta.solana.com"))
     parser.add_argument("--rpc-suffix", default=os.environ.get("RPC_SUFFIX", ":8899"))
+    parser.add_argument("--all-advertised-rpc", action="store_true", help="Probe every advertised RPC endpoint instead of filtering by --rpc-suffix.")
     parser.add_argument("--rpc-scheme", default=os.environ.get("RPC_SCHEME", "http"))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("TIMEOUT_SECONDS", "2")))
     parser.add_argument("--parallel", type=int, default=int(os.environ.get("MAX_PARALLEL", "48")))
     parser.add_argument("--print-first", type=int, default=int(os.environ.get("PRINT_FIRST", "50")))
     parser.add_argument("--out-dir", default=os.environ.get("OUT_DIR", "logs"))
     parser.add_argument("--expected-genesis-hash", default=os.environ.get("EXPECTED_GENESIS_HASH", MAINNET_GENESIS_HASH))
+    parser.add_argument("--get-multiple-accounts", default=os.environ.get("GET_MULTIPLE_ACCOUNTS"), help="Account pubkey to probe with getMultipleAccounts; 64-char hex is converted to base58.")
+    parser.add_argument("--account-encoding", default=os.environ.get("ACCOUNT_ENCODING", "base64"))
     parser.add_argument("--probe-grpc", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--grpc-port", type=int, default=int(os.environ.get("GRPC_PORT", "10000")))
     parser.add_argument("--grpc-timeout", type=float, default=float(os.environ.get("GRPC_TIMEOUT_SECONDS", "1")))
     parser.add_argument("--grpc-for-all", action="store_true", help="Probe gRPC port even if RPC did not respond.")
     parser.add_argument("--grpc-h2c", action="store_true", help="Use curl --http2-prior-knowledge to identify h2c gRPC status.")
     args = parser.parse_args()
+    if args.get_multiple_accounts:
+        args.get_multiple_accounts = normalize_pubkey(args.get_multiple_accounts)
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     nodes, cluster_latency_ms = load_nodes(args)
-    candidates = [node for node in nodes if str(node.get("rpc") or "").endswith(args.rpc_suffix)]
+    candidates = [node for node in nodes if str(node.get("rpc") or "")]
+    if not args.all_advertised_rpc:
+        candidates = [node for node in candidates if str(node.get("rpc") or "").endswith(args.rpc_suffix)]
 
     start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         results = list(pool.map(lambda node: probe_node(node, args), candidates))
     elapsed = round(time.perf_counter() - start, 2)
 
-    results.sort(key=lambda r: (not r.ok, int(r.rpc_latency_ms or 10**12), r.rpc))
+    if args.get_multiple_accounts:
+        results.sort(key=lambda r: (not r.get_multiple_accounts_ok, int(r.get_multiple_accounts_latency_ms or 10**12), r.rpc))
+    else:
+        results.sort(key=lambda r: (not r.ok, int(r.rpc_latency_ms or 10**12), r.rpc))
     alive = [row for row in results if row.ok]
     healthy = [row for row in alive if row.health == "ok"]
     not_healthy = [row for row in alive if row.health != "ok"]
     grpc_open = [row for row in alive if row.grpc_tcp_open]
+    get_multiple_accounts_supported = [row for row in results if row.get_multiple_accounts_ok]
     latencies = [int(row.rpc_latency_ms) for row in alive if row.rpc_latency_ms != ""]
+    get_multiple_accounts_latencies = [int(row.get_multiple_accounts_latency_ms) for row in get_multiple_accounts_supported if row.get_multiple_accounts_latency_ms != ""]
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.abspath(os.path.join(args.out_dir, f"solana_validator_rpc_health_{stamp}.csv"))
@@ -249,11 +299,13 @@ def main() -> int:
         "clusterRpc": args.cluster_rpc,
         "clusterRpcLatencyMs": cluster_latency_ms,
         "totalNodes": len(nodes),
-        "advertisedRpcSuffix": args.rpc_suffix,
+        "advertisedRpcSuffix": "*" if args.all_advertised_rpc else args.rpc_suffix,
         "advertisedRpcCount": len(candidates),
         "rpcUsable": len(alive),
         "rpcHealthy": len(healthy),
         "rpcRespondingButNotHealthy": len(not_healthy),
+        "getMultipleAccountsAccount": args.get_multiple_accounts or "",
+        "getMultipleAccountsSupported": len(get_multiple_accounts_supported),
         "grpcPort": args.grpc_port,
         "grpcTcpOpenAmongUsableRpc": len(grpc_open),
         "scanElapsedSeconds": elapsed,
@@ -263,10 +315,17 @@ def main() -> int:
             "p95": percentile(latencies, 0.95),
             "max": max(latencies) if latencies else "",
         },
+        "getMultipleAccountsLatencyMs": {
+            "min": min(get_multiple_accounts_latencies) if get_multiple_accounts_latencies else "",
+            "p50": percentile(get_multiple_accounts_latencies, 0.50),
+            "p95": percentile(get_multiple_accounts_latencies, 0.95),
+            "max": max(get_multiple_accounts_latencies) if get_multiple_accounts_latencies else "",
+        },
         "csv": csv_path,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
+    print_table("GET_MULTIPLE_ACCOUNTS_RPC", get_multiple_accounts_supported, args.print_first)
     print_table("HEALTHY_RPC", healthy, args.print_first)
     print_table(f"GRPC_{args.grpc_port}_TCP_OPEN", grpc_open, args.print_first)
     print_table("RESPONDING_BUT_NOT_HEALTHY", not_healthy, args.print_first)
