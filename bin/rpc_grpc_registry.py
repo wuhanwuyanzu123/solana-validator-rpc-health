@@ -436,11 +436,15 @@ class Snapshot:
         self._data: dict[str, Any] = {}
         self._scanning = False
         self._last_error: str | None = None
+        self._consecutive_failures = 0
+        self._last_success_at: float | None = None
 
     def publish(self, data: dict[str, Any]) -> None:
         with self._lock:
             self._data = data
             self._last_error = None
+            self._consecutive_failures = 0
+            self._last_success_at = time.time()
 
     def get(self) -> dict[str, Any]:
         with self._lock:
@@ -450,9 +454,10 @@ class Snapshot:
         with self._lock:
             self._scanning = value
 
-    def set_error(self, message: str) -> None:
+    def record_failure(self, message: str) -> None:
         with self._lock:
             self._last_error = message
+            self._consecutive_failures += 1
 
     @property
     def scanning(self) -> bool:
@@ -463,6 +468,16 @@ class Snapshot:
     def last_error(self) -> str | None:
         with self._lock:
             return self._last_error
+
+    @property
+    def consecutive_failures(self) -> int:
+        with self._lock:
+            return self._consecutive_failures
+
+    @property
+    def last_success_at(self) -> float | None:
+        with self._lock:
+            return self._last_success_at
 
 
 # --------------------------------------------------------------------------
@@ -759,6 +774,7 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
                 candidates.append(futures[future])
 
     versioned: list[dict[str, Any]] = []
+    auth_required: list[str] = []
     with ThreadPoolExecutor(max_workers=args.grpc_parallel) as pool:
         futures = {
             pool.submit(grpc_get_version, ip, port, proto_dir, proto_file, args.grpc_timeout): (ip, port)
@@ -767,6 +783,9 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
         for future in as_completed(futures):
             ip, port = futures[future]
             result = future.result()
+            if result["status"] == "AUTH_REQUIRED":
+                auth_required.append(f"{ip}:{port}")
+                continue
             if result["status"] != "OK":
                 continue
             versioned.append({"host": ip, "port": port, "version": result.get("version", "")})
@@ -794,11 +813,13 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
             "tcp_open": len(open_pairs),
             "h2c": len(candidates),
             "getversion_ok": len(versioned),
+            # Endpoints that need a token are discarded, not listed: a caller
+            # cannot use them, so only the count is worth reporting.
+            "auth_required_dropped": len(auth_required),
             "subscribe_ok": len(verified),
         },
         "latency_ms": _percentiles(latencies),
         "endpoints": verified,
-        "auth_required": [f"{ip}:{port}" for ip, port in candidates],
         "ports": ports,
     }
 
@@ -869,7 +890,7 @@ def run_scan(args: argparse.Namespace, snapshot: Snapshot, proto_dir: str, proto
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 - scan must not kill the server
-        snapshot.set_error(f"{type(exc).__name__}: {exc}")
+        snapshot.record_failure(f"{type(exc).__name__}: {exc}")
         print(f"[scan] failed: {type(exc).__name__}: {exc}", flush=True)
     finally:
         snapshot.set_scanning(False)
@@ -893,10 +914,36 @@ def _restore(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _brief(message: str, limit: int = 300) -> str:
+    """Collapse a multi-line error into one short line.
+
+    The probe tool embeds its whole stderr in the failure message, which used to
+    end up stored in the snapshot and re-served by /health — a wall of traceback
+    in every response. Keep the head, drop the rest.
+    """
+    text = " ".join(str(message).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def scan_loop(args: argparse.Namespace, snapshot: Snapshot, proto_dir: str, proto_file: str) -> None:
+    """Scan on a fixed cadence, forever.
+
+    This thread is the service's only source of fresh data, so nothing may
+    escape it: a single unhandled error used to terminate it silently while the
+    HTTP server kept answering 200s with a stale snapshot.
+    """
     while True:
-        run_scan(args, snapshot, proto_dir, proto_file)
-        time.sleep(max(30, args.interval))
+        cycle_started = time.monotonic()
+        try:
+            run_scan(args, snapshot, proto_dir, proto_file)
+        except BaseException as exc:  # noqa: BLE001 - the loop must outlive anything
+            snapshot.record_failure(_brief(f"{type(exc).__name__}: {exc}"))
+            print(f"[scan] loop error: {type(exc).__name__}: {_brief(str(exc))}", flush=True)
+
+        # Fixed cadence: sleep the remainder of the interval rather than a full
+        # interval after each scan, so a slow scan does not push the schedule out.
+        elapsed = time.monotonic() - cycle_started
+        time.sleep(max(30.0, args.interval - elapsed))
 
 
 # --------------------------------------------------------------------------
@@ -1011,6 +1058,11 @@ def make_handler(snapshot: Snapshot, args: argparse.Namespace):
                     "age_seconds": round(time.time() - data["scanned_at"], 1) if data.get("scanned_at") else None,
                     "fresh": fresh,
                     "interval_seconds": args.interval,
+                    # The scan thread swallows errors and keeps looping, so a
+                    # streak of failures is otherwise invisible until the data
+                    # quietly goes stale.
+                    "consecutive_failures": snapshot.consecutive_failures,
+                    "last_success_at": snapshot.last_success_at,
                     "totals": data.get("totals", {}),
                 })
                 return
@@ -1063,6 +1115,11 @@ def make_handler(snapshot: Snapshot, args: argparse.Namespace):
                 section["endpoints"] = endpoints[:limit]
                 section["returned"] = len(section["endpoints"])
                 section["available"] = len(endpoints)
+                # Diagnostic lists would otherwise ignore ?limit and dominate the
+                # payload, which defeats the purpose of asking for a small page.
+                for diagnostic in ("partial_endpoints",):
+                    if isinstance(section.get(diagnostic), list):
+                        section[diagnostic] = section[diagnostic][:limit]
             section["scanned_at"] = data.get("scanned_at")
             section["fresh"] = time.time() <= data.get("expires_at", 0)
             return section
