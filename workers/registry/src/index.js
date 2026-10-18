@@ -10,6 +10,7 @@
  *   GET  /health            scanner + snapshot status    (public, no secrets)
  *   POST /pay               redeem a SOL payment for your account (signed in)
  *   GET  /admin/keys        list keys                    (ADMIN_TOKEN)
+ *   POST /admin/accounts/activate {email}  grant without payment (ADMIN_TOKEN)
  *   POST /admin/keys        mint a key                   (ADMIN_TOKEN)
  *   POST /admin/keys/revoke revoke a key                 (ADMIN_TOKEN)
  *   GET  /                  HTML dashboard
@@ -253,6 +254,20 @@ export class RegistryStore extends DurableObject {
       return { ok: false, reason: "expired" };
     }
     return { ok: true, id: row.id, email: row.email, status: row.status };
+  }
+
+  /**
+   * Grant entitlement without a chain payment — for an operator, or when a
+   * member paid out of band and verification could not confirm it.
+   */
+  activateAccountByEmail(email) {
+    const row = [...this.sql.exec(
+      `SELECT id, status FROM accounts WHERE email = ?`, email,
+    )][0];
+    if (!row) return { ok: false, error: "ACCOUNT_NOT_FOUND" };
+    const issued = this.issueKeyForAccount(row.id);
+    return { ok: true, id: row.id, email, already: row.status === "active",
+             api_key: issued.key };
   }
 
   hasPaymentForAccount(accountId) {
@@ -667,6 +682,20 @@ async function handleAdmin(req, env, store) {
     const days = Number(body.days || env.GRANT_DAYS || SESSION_DAYS);
     const issued = await store.createKey(body.label || "manual", days);
     return json({ ok: true, ...issued, warning: "This key is shown only once." });
+  }
+  if (req.method === "POST" && url.pathname === "/admin/accounts/activate") {
+    let body = {};
+    try {
+      body = await req.json();
+    } catch { /* fall through to the email check */ }
+    const email = String(body.email || "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return json({ error: "a valid email is required" }, 400);
+    const result = await store.activateAccountByEmail(email);
+    if (!result.ok) return json({ error: "no such account" }, 404);
+    return json({ ok: true, ...result,
+      note: result.already
+        ? "already active"
+        : "account activated; API key shown once if it had none yet." });
   }
   if (req.method === "POST" && url.pathname === "/admin/keys/revoke") {
     let body = {};
