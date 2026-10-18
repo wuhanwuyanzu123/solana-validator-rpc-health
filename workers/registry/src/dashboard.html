@@ -226,7 +226,7 @@
       <p>Email and password. Nothing is charged yet — the account just gives you
       a place to sign in.</p></div>
     <div class="step"><span class="n">2</span><h4>Pay once you're in</h4>
-      <p>From inside your account, send USDC and paste the transaction
+      <p>From inside your account, send SOL and paste the transaction
       signature. Verification is automatic.</p></div>
     <div class="step"><span class="n">3</span><h4>Use it</h4>
       <p>The console unlocks immediately, and you receive an API key for
@@ -234,8 +234,8 @@
   </div>
 
   <div class="pricing">
-    <div class="price">5 <small>USDC</small></div>
-    <div class="price-sub">per 30 days · billed on-chain</div>
+    <div class="price"><span id="p-price">—</span> <small>SOL</small></div>
+    <div class="price-sub" id="p-per">per month · billed on-chain</div>
     <ul class="plist">
       <li><span class="yes">✓</span> Full JSON-RPC list with capability flags</li>
       <li><span class="yes">✓</span> Full Yellowstone gRPC stream list</li>
@@ -298,7 +298,7 @@
 <div id="v-pay" class="hide">
   <div class="cbox">
     <h2>Activate your account</h2>
-    <p class="lead">Send USDC to the address below, then paste the transaction
+    <p class="lead">Send SOL to the address below, then paste the transaction
       signature here.</p>
 
     <div class="notice info" id="pay-welcome"></div>
@@ -313,11 +313,11 @@
       </div>
       <div class="payrow">
         <div class="lbl">Amount</div>
-        <div class="val" id="pay-amount">5 USDC / 30 days</div>
+        <div class="val" id="pay-amount">loading…</div>
       </div>
       <div class="payrow">
-        <div class="lbl">Token</div>
-        <div class="val" style="font-size:13px">USDC</div>
+        <div class="lbl">Asset</div>
+        <div class="val" style="font-size:13px">SOL (native)</div>
       </div>
       <input class="field mono" id="pay-sig" placeholder="Transaction signature"
              autocomplete="off">
@@ -455,9 +455,12 @@ function loadHealth(){
       else if(d.stale){dot.className='dot stale';ageEl.textContent='stale · '+fmtAge(d.snapshot_age_seconds);}
       else{dot.className='dot ok';ageEl.textContent='fresh · '+fmtAge(d.snapshot_age_seconds);}
 
+      var price=p.price||'—', days=p.grant_days||30;
+      $('p-price').textContent=price;
+      $('p-per').textContent='per '+days+' days · billed on-chain';
       if(p.pay_to){
         $('pay-addr').textContent=p.pay_to;
-        $('pay-amount').textContent=(p.price_usdc||'5')+' USDC / '+(p.grant_days||30)+' days';
+        $('pay-amount').textContent=price+' SOL / '+days+' days';
         $('pay-closed').classList.add('hide');
         $('pay-form').classList.remove('hide');
       }else{

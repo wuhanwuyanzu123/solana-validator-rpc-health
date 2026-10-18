@@ -8,14 +8,14 @@
  *   POST /ingest            scanner pushes a snapshot   (INGEST_TOKEN)
  *   GET  /rpc|/grpc|/all    member reads endpoints      (API key)
  *   GET  /health            scanner + snapshot status    (public, no secrets)
- *   POST /pay               redeem a USDC/SOL payment    (public)
+ *   POST /pay               redeem a SOL payment for your account (signed in)
  *   GET  /admin/keys        list keys                    (ADMIN_TOKEN)
  *   POST /admin/keys        mint a key                   (ADMIN_TOKEN)
  *   POST /admin/keys/revoke revoke a key                 (ADMIN_TOKEN)
  *   GET  /                  HTML dashboard
  */
 
-const USDC_DECIMALS = 6;
+// Native SOL is the paid asset; 1 SOL = 1e9 lamports.
 const SOL_DECIMALS = 9;
 const KEY_PREFIX = "sk_";
 const SESSION_DAYS = 30;
@@ -373,78 +373,114 @@ export class RegistryStore extends DurableObject {
 // -------------------------------------------------------- payment verifying
 
 /**
- * Confirm a payment landed on-chain.
+ * Confirm a payment landed on-chain: native SOL sent to PAY_TO.
  *
- * Reads the parsed transaction and compares the recipient's token balance
- * before and after, which is robust to how the transfer was constructed
- * (direct transfer, routed swap, multiple hops) in a way that scanning
- * instruction lists is not.
+ * Read the recipient's balance before and after the transaction rather than
+ * scanning instruction lists, so the check holds no matter how the sender
+ * constructed it — a direct transfer, a routed path, or ALT-loaded keys.
  */
 async function verifyPayment(env, signature) {
-  const price = Number(env.PRICE_USDC || "0");
+  const price = Number(env.PRICE_SOL || "0");
   const payTo = (env.PAY_TO || "").trim();
   if (!payTo) return { ok: false, error: "no receiving address configured (PAY_TO)" };
-  if (!(price > 0)) return { ok: false, error: "price not configured (PRICE_USDC)" };
-  if (!/^[1-9A-HJ-NP-Za-km-z]{32,90}$/.test(signature)) {
+  if (!(price > 0)) return { ok: false, error: "price not configured (PRICE_SOL)" };
+  // Solana signatures are 64 bytes -> 87-88 base58 chars; allow a margin.
+  if (!/^[1-9A-HJ-NP-Za-km-z]{60,120}$/.test(signature)) {
     return { ok: false, error: "signature format is not valid" };
   }
 
-  const rpc = env.RPC_FOR_VERIFY || "https://api.mainnet-beta.solana.com";
-  let tx;
-  try {
-    const res = await fetch(rpc, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTransaction",
-        params: [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }],
-      }),
-    });
-    const body = await res.json();
-    tx = body.result;
-    if (body.error) return { ok: false, error: `RPC: ${body.error.message || "query failed"}` };
-  } catch (err) {
-    return { ok: false, error: `RPC request failed: ${String(err).slice(0, 80)}` };
+  // Public RPCs rate-limit and occasionally block whole egress ranges (we hit
+  // "IP blocked" from this network), so try a list in order. A response that
+  // parses as JSON-RPC is authoritative — even a null result — and stops the
+  // loop; only transport failures fall through to the next endpoint.
+  const endpoints = String(env.RPC_FOR_VERIFY || "https://api.mainnet-beta.solana.com")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const payload = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "getTransaction",
+    // v1 transactions are common now; asking for 0 makes the RPC refuse blocks
+    // that contain them with -32015.
+    params: [signature, { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }],
+  });
+
+  let tx = null;
+  const failures = [];
+  let authoritative = null;
+
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: payload,
+      });
+      const body = await res.json();
+      if (body && typeof body === "object" && ("result" in body || "error" in body)) {
+        authoritative = { endpoint, body };
+        break;
+      }
+      failures.push(`${endpoint}: unexpected body`);
+    } catch (err) {
+      failures.push(`${endpoint}: ${String(err).slice(0, 60)}`);
+    }
   }
 
-  if (!tx) return { ok: false, error: "transaction not found on chain — wait until it confirms, then retry" };
+  if (!authoritative) {
+    return { ok: false, error: `no RPC reachable (${failures.slice(0, 3).join("; ")})` };
+  }
+  if (authoritative.body.error) {
+    return { ok: false, error: `RPC: ${authoritative.body.error.message || "query failed"}` };
+  }
+  tx = authoritative.body.result;
+
+  if (!tx) {
+    return { ok: false, error: "transaction not found on chain — wait until it confirms, then retry" };
+  }
   if (tx.meta && tx.meta.err) return { ok: false, error: "that transaction failed on chain" };
 
-  const usdcMint = env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  const required = BigInt(Math.round(price * 10 ** USDC_DECIMALS));
+  const pre = tx.meta?.preBalances;
+  const post = tx.meta?.postBalances;
+  if (!Array.isArray(pre) || !Array.isArray(post)) {
+    return { ok: false, error: "transaction has no balance data" };
+  }
 
-  const balanceOf = (list, mint, owner) => {
-    const hit = (list || []).find(
-      (b) => b.mint === mint && b.owner === owner,
-    );
-    return hit ? BigInt(hit.uiTokenAmount.amount) : 0n;
-  };
+  // Balance arrays cover static keys first, then ALT-loaded writable keys,
+  // then loaded readonly keys. Index into that same order.
+  const staticKeys = tx.transaction?.message?.accountKeys || [];
+  const loaded = tx.meta?.loadedAddresses || {};
+  const order = [
+    ...staticKeys.map((k) => (typeof k === "string" ? k : k.pubkey)),
+    ...(loaded.writable || []),
+    ...(loaded.readonly || []),
+  ];
+  const idx = order.indexOf(payTo);
+  if (idx < 0 || idx >= pre.length) {
+    return { ok: false, error: "the receiving address does not appear in this transaction" };
+  }
 
-  const pre = balanceOf(tx.meta?.preTokenBalances, usdcMint, payTo);
-  const post = balanceOf(tx.meta?.postTokenBalances, usdcMint, payTo);
-  const received = post - pre;
+  const delta = BigInt(post[idx]) - BigInt(pre[idx]);
+  const required = BigInt(Math.round(price * 10 ** SOL_DECIMALS));
 
-  if (received < required) {
-    const got = Number(received) / 10 ** USDC_DECIMALS;
+  if (delta < required) {
+    const got = Number(delta) / 10 ** SOL_DECIMALS;
     return {
       ok: false,
-      error: `insufficient amount received: ${got} USDC (required ${price} USDC)`,
+      error: `insufficient amount received: ${got} SOL (required ${price} SOL)`,
       received: got,
     };
   }
 
-  const feePayer = tx.transaction?.message?.accountKeys?.[0]?.pubkey
-    || tx.transaction?.message?.accountKeys?.[0]
-    || "";
-
+  const feePayer = staticKeys[0];
   return {
     ok: true,
     signature,
-    mint: usdcMint,
-    amount: received.toString(),
-    payer: typeof feePayer === "string" ? feePayer : "",
+    asset: "SOL",
+    amount: delta.toString(),
+    payer: typeof feePayer === "string" ? feePayer : (feePayer?.pubkey || ""),
     slot: tx.slot,
   };
 }
@@ -488,11 +524,11 @@ async function handleHealth(env, store) {
     // Public facts the sign-up and payment forms both need. The receiving
     // address is a published payment destination, not a secret.
     pricing: {
-      price_usdc: env.PRICE_USDC || "0",
+      price: env.PRICE_SOL || "0",
+      asset: "SOL",
       pay_to: (env.PAY_TO || "").trim(),
       grant_days: Number(env.GRANT_DAYS || String(SESSION_DAYS)),
-      usdc_mint: env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      open: Boolean((env.PAY_TO || "").trim()) && Number(env.PRICE_USDC || 0) > 0,
+      open: Boolean((env.PAY_TO || "").trim()) && Number(env.PRICE_SOL || 0) > 0,
     },
   });
 }
@@ -595,7 +631,7 @@ async function handlePay(req, env, store, session) {
   const issued = await store.issueKeyForAccount(account.id);
   await store.recordPayment({
     signature,
-    mint: verdict.mint,
+    mint: verdict.asset,
     amount: verdict.amount,
     payer: verdict.payer,
     keyId: account.id,
@@ -1008,7 +1044,7 @@ const DASHBOARD_HTML = `<!doctype html>
       <p>Email and password. Nothing is charged yet — the account just gives you
       a place to sign in.</p></div>
     <div class="step"><span class="n">2</span><h4>Pay once you're in</h4>
-      <p>From inside your account, send USDC and paste the transaction
+      <p>From inside your account, send SOL and paste the transaction
       signature. Verification is automatic.</p></div>
     <div class="step"><span class="n">3</span><h4>Use it</h4>
       <p>The console unlocks immediately, and you receive an API key for
@@ -1016,8 +1052,8 @@ const DASHBOARD_HTML = `<!doctype html>
   </div>
 
   <div class="pricing">
-    <div class="price">5 <small>USDC</small></div>
-    <div class="price-sub">per 30 days · billed on-chain</div>
+    <div class="price"><span id="p-price">—</span> <small>SOL</small></div>
+    <div class="price-sub" id="p-per">per month · billed on-chain</div>
     <ul class="plist">
       <li><span class="yes">✓</span> Full JSON-RPC list with capability flags</li>
       <li><span class="yes">✓</span> Full Yellowstone gRPC stream list</li>
@@ -1080,7 +1116,7 @@ const DASHBOARD_HTML = `<!doctype html>
 <div id="v-pay" class="hide">
   <div class="cbox">
     <h2>Activate your account</h2>
-    <p class="lead">Send USDC to the address below, then paste the transaction
+    <p class="lead">Send SOL to the address below, then paste the transaction
       signature here.</p>
 
     <div class="notice info" id="pay-welcome"></div>
@@ -1095,11 +1131,11 @@ const DASHBOARD_HTML = `<!doctype html>
       </div>
       <div class="payrow">
         <div class="lbl">Amount</div>
-        <div class="val" id="pay-amount">5 USDC / 30 days</div>
+        <div class="val" id="pay-amount">loading…</div>
       </div>
       <div class="payrow">
-        <div class="lbl">Token</div>
-        <div class="val" style="font-size:13px">USDC</div>
+        <div class="lbl">Asset</div>
+        <div class="val" style="font-size:13px">SOL (native)</div>
       </div>
       <input class="field mono" id="pay-sig" placeholder="Transaction signature"
              autocomplete="off">
@@ -1237,9 +1273,12 @@ function loadHealth(){
       else if(d.stale){dot.className='dot stale';ageEl.textContent='stale · '+fmtAge(d.snapshot_age_seconds);}
       else{dot.className='dot ok';ageEl.textContent='fresh · '+fmtAge(d.snapshot_age_seconds);}
 
+      var price=p.price||'—', days=p.grant_days||30;
+      $('p-price').textContent=price;
+      $('p-per').textContent='per '+days+' days · billed on-chain';
       if(p.pay_to){
         $('pay-addr').textContent=p.pay_to;
-        $('pay-amount').textContent=(p.price_usdc||'5')+' USDC / '+(p.grant_days||30)+' days';
+        $('pay-amount').textContent=price+' SOL / '+days+' days';
         $('pay-closed').classList.add('hide');
         $('pay-form').classList.remove('hide');
       }else{

@@ -8,10 +8,9 @@
     }
   },
   "vars": {
-    "PRICE_USDC": "5",
-    "PAY_TO": "",
-    "USDC_MINT": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "RPC_FOR_VERIFY": "https://api.mainnet-beta.solana.com",
+    "PAY_TO": "B5ZNDYgDCdZZSZQ4qSDrPrEd4XYabvwpVHcX1phrZtR5",
+    "PRICE_SOL": "0.1",
+    "RPC_FOR_VERIFY": "https://solana-rpc.publicnode.com,https://rpc.ankr.com/solana,https://solana.drpc.org,https://api.mainnet-beta.solana.com",
     "GRANT_DAYS": "30"
   },
   "kv_namespaces": [],
