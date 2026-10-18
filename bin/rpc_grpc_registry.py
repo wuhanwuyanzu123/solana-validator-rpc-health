@@ -1412,6 +1412,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="hard cap on one RPC scan invocation")
     parser.add_argument("--no-scan", action="store_true",
                         help="serve only the persisted snapshot; do not scan")
+    parser.add_argument("--no-serve", action="store_true",
+                        help="scan and push but bind no HTTP port — members read "
+                             "the Cloudflare Worker, so this host should not "
+                             "publish a console of its own")
     parser.add_argument("--push-url",
                         default=os.environ.get("REGISTRY_PUSH_URL", ""),
                         help="Worker base URL to publish each snapshot to "
@@ -1485,6 +1489,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         run_scan(args, snapshot, args.grpc_proto_dir, args.grpc_proto_file)
         print(json.dumps(snapshot.get(), indent=2))
+        return 0
+
+    if args.no_serve:
+        if args.no_scan:
+            print("[fatal] --no-serve with --no-scan would do nothing", file=sys.stderr)
+            return 2
+        print(
+            f"[scan-only] no HTTP port; publishing to cloud every {args.interval}s",
+            flush=True,
+        )
+        # Foreground, not a daemon thread: this process exists only to scan and
+        # push, so the loop owning the main thread keeps it alive.
+        scan_loop(args, snapshot, args.grpc_proto_dir, args.grpc_proto_file)
         return 0
 
     if not args.no_scan:
