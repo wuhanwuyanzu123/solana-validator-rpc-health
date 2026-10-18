@@ -2,3 +2,6 @@ logs/
 *.pyc
 __pycache__/
 .DS_Store
+
+# wrangler local cache / login state
+.wrangler/

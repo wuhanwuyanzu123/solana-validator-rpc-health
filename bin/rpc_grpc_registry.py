@@ -1067,6 +1067,7 @@ def run_scan(args: argparse.Namespace, snapshot: Snapshot, proto_dir: str, proto
         }
         snapshot.publish(payload)
         _persist(args.state_file, payload)
+        _push_to_cloud(args, payload)
         print(
             f"[scan] done in {rpc_result['scan_seconds'] + grpc_result['scan_seconds']}s "
             f"rpc_usable={payload['totals']['rpc_usable']} "
@@ -1088,6 +1089,55 @@ def _persist(path: str, payload: dict[str, Any]) -> None:
         os.replace(tmp, path)
     except OSError as exc:
         print(f"[persist] {exc}", flush=True)
+
+
+def _push_to_cloud(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    """Publish the snapshot to the Worker that members read from.
+
+    Best-effort: a failed push must never abort the scan, and the previous
+    snapshot stays served in the meantime. Runs in its own thread so a slow or
+    unreachable endpoint cannot stall the scan loop.
+
+    Sends through curl rather than urllib: Cloudflare rejects urllib with a
+    browser-fingerprinting 403 (error 1010) while curl is accepted, and this
+    endpoint sits behind that check.
+    """
+    url = getattr(args, "push_url", "")
+    if not url:
+        return
+
+    def _send() -> None:
+        body = json.dumps(payload)
+        cmd = [
+            "curl", "-sS", "-m", str(args.push_timeout),
+            "-o", "/dev/null", "-w", "%{http_code}",
+            "-X", "POST",
+            "-H", "Authorization: Bearer " + args.push_token,
+            "-H", "Content-Type: application/json",
+            "--data-binary", "@-",
+            url.rstrip("/") + "/ingest",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, input=body, capture_output=True, text=True, timeout=args.push_timeout + 10
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[push] failed: {type(exc).__name__}: {exc}", flush=True)
+            return
+
+        code = (proc.stdout or "").strip()
+        if code == "200":
+            totals = payload.get("totals") or {}
+            print(
+                f"[push] ok rpc={totals.get('rpc_usable')} grpc={totals.get('grpc_usable')}",
+                flush=True,
+            )
+        else:
+            tail = (proc.stderr or code or "").strip()[:200]
+            print(f"[push] failed: http={code or 'none'} {tail}", flush=True)
+
+    thread = threading.Thread(target=_send, daemon=True, name="registry-push")
+    thread.start()
 
 
 def _restore(path: str) -> dict[str, Any] | None:
@@ -1362,6 +1412,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="hard cap on one RPC scan invocation")
     parser.add_argument("--no-scan", action="store_true",
                         help="serve only the persisted snapshot; do not scan")
+    parser.add_argument("--push-url",
+                        default=os.environ.get("REGISTRY_PUSH_URL", ""),
+                        help="Worker base URL to publish each snapshot to "
+                             "(env: REGISTRY_PUSH_URL)")
+    parser.add_argument("--push-token",
+                        default=os.environ.get("REGISTRY_PUSH_TOKEN", ""),
+                        help="INGEST_TOKEN for that Worker (env: REGISTRY_PUSH_TOKEN)")
+    parser.add_argument("--push-token-file",
+                        help="read the push token from this file instead of --push-token")
+    parser.add_argument("--push-timeout", type=float, default=30.0,
+                        help="seconds to wait for the push to be accepted")
     parser.add_argument("--once", action="store_true",
                         help="run a single scan, print it, and exit without serving")
     parser.add_argument("--verbose", action="store_true")
@@ -1389,6 +1450,20 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # Falling back to the built-in password; say so without printing it.
         print(f"[auth] enabled (built-in password, user={args.user})", flush=True)
+
+    if args.push_token_file:
+        try:
+            with open(args.push_token_file, encoding="utf-8") as fh:
+                args.push_token = fh.read().strip()
+        except OSError as exc:
+            print(f"[fatal] cannot read --push-token-file: {exc}", file=sys.stderr)
+            return 2
+    if args.push_url:
+        if args.push_token:
+            print(f"[push] enabled -> {args.push_url}", flush=True)
+        else:
+            print(f"[push] {args.push_url} set but no token; pushes will be rejected",
+                  file=sys.stderr)
 
     proto_file = find_proto_file(args.grpc_proto_dir)
     if not proto_file:
