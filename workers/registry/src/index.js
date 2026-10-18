@@ -53,11 +53,39 @@ async function sha256Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// Workers caps PBKDF2 iterations at 100000; asking for more raises
+// NotSupportedError at derive time. Stay exactly at the ceiling.
+const PBKDF2_ITERATIONS = 100_000;
+
+async function hashPassword(password, salt) {
+  const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: enc.encode(salt),
+      iterations: PBKDF2_ITERATIONS,
+      hash: "SHA-256",
+    },
+    material,
+    256,
+  );
+  return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomSecret(bytes = 24) {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return [...buf].map((b) => b.toString(36).padStart(2, "0")).join("").slice(0, bytes * 2);
+}
+
 function randomKey() {
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  const body = [...bytes].map((b) => b.toString(36).padStart(2, "0")).join("");
-  return KEY_PREFIX + body.slice(0, 32);
+  return KEY_PREFIX + randomSecret(24).slice(0, 32);
+}
+
+function randomSession() {
+  return "sess_" + randomSecret(20).slice(0, 32);
 }
 
 function bearer(req) {
@@ -103,7 +131,135 @@ export class RegistryStore extends DurableObject {
         key_id INTEGER,
         redeemed_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        pw_salt TEXT NOT NULL,
+        pw_hash TEXT NOT NULL,
+        -- pending: signed up, no entitlement yet. active: paid and entitled.
+        status TEXT NOT NULL DEFAULT 'pending',
+        session_hash TEXT,
+        session_expires INTEGER,
+        apikey_hash TEXT,
+        key_expires INTEGER,
+        created_at INTEGER NOT NULL,
+        paid_at INTEGER
+      );
     `);
+  }
+
+  // -- accounts --------------------------------------------------------------
+
+  /**
+   * Create an account. Payment comes afterwards, so a new account is entitled
+   * to nothing yet — it exists only so the holder can sign in and pay later.
+   */
+  async createAccount(email, password) {
+    const salt = randomSecret(12);
+    const pwHash = await hashPassword(password, salt);
+    try {
+      this.sql.exec(
+        `INSERT INTO accounts (email, pw_salt, pw_hash, status, created_at)
+         VALUES (?, ?, ?, 'pending', ?)`,
+        email, salt, pwHash, nowSec(),
+      );
+    } catch (err) {
+      if (/UNIQUE/i.test(String(err))) return { ok: false, error: "EMAIL_TAKEN" };
+      throw err;
+    }
+    const id = [...this.sql.exec(`SELECT last_insert_rowid() AS id`)][0].id;
+    const session = randomSession();
+    this._setSession(id, session);
+    return { ok: true, id, email, status: "pending", session };
+  }
+
+  async loginAccount(email, password) {
+    const rows = [...this.sql.exec(
+      `SELECT id, email, pw_salt, pw_hash, status FROM accounts WHERE email = ?`,
+      email,
+    )];
+    if (!rows.length) return { ok: false, error: "BAD_CREDENTIALS" };
+    const row = rows[0];
+    const attempt = await hashPassword(password, row.pw_salt);
+    if (!timingSafeEqual(attempt, row.pw_hash)) {
+      return { ok: false, error: "BAD_CREDENTIALS" };
+    }
+    const session = randomSession();
+    this._setSession(row.id, session);
+    return { ok: true, id: row.id, email: row.email, status: row.status, session };
+  }
+
+  _setSession(id, session) {
+    const at = nowSec();
+    // Sessions last a day; the page re-prompts for password afterwards.
+    this.sql.exec(
+      `UPDATE accounts SET session_hash = ?, session_expires = ? WHERE id = ?`,
+      session, at + 86400, id,
+    );
+    return session;
+  }
+
+  async accountBySession(token) {
+    if (!token.startsWith("sess_")) return { ok: false, reason: "malformed" };
+    const hash = token;
+    const rows = [...this.sql.exec(
+      `SELECT id, email, status, session_expires, apikey_hash, key_expires
+       FROM accounts WHERE session_hash = ?`,
+      hash,
+    )];
+    if (!rows.length) return { ok: false, reason: "unknown" };
+    const row = rows[0];
+    if (!row.session_expires || row.session_expires <= nowSec()) {
+      return { ok: false, reason: "expired" };
+    }
+    return {
+      ok: true,
+      id: row.id,
+      email: row.email,
+      status: row.status,
+      has_api_key: Boolean(row.apikey_hash),
+      key_expires: row.key_expires,
+    };
+  }
+
+  /** Entitle an account: mark it active and hand over its API key. */
+  issueKeyForAccount(accountId) {
+    const existing = [...this.sql.exec(
+      `SELECT apikey_hash FROM accounts WHERE id = ? AND apikey_hash IS NOT NULL`,
+      accountId,
+    )][0];
+    if (existing) return { key: null, expires: null, reused: true };
+
+    const key = randomKey();
+    const expires = nowSec() + Number(SESSION_DAYS) * 86400;
+    this.sql.exec(
+      `UPDATE accounts SET status = 'active', apikey_hash = ?, key_expires = ?, paid_at = ?
+       WHERE id = ?`,
+      key, expires, nowSec(), accountId,
+    );
+    return { key, expires, reused: false };
+  }
+
+  async accountByApiKey(token) {
+    if (!token.startsWith(KEY_PREFIX)) return { ok: false, reason: "malformed" };
+    const rows = [...this.sql.exec(
+      `SELECT id, email, status, key_expires FROM accounts WHERE apikey_hash = ?`,
+      token,
+    )];
+    if (!rows.length) return { ok: false, reason: "unknown" };
+    const row = rows[0];
+    if (row.status !== "active") return { ok: false, reason: "unpaid" };
+    if (!row.key_expires || row.key_expires <= nowSec()) {
+      return { ok: false, reason: "expired" };
+    }
+    return { ok: true, id: row.id, email: row.email, status: row.status };
+  }
+
+  hasPaymentForAccount(accountId) {
+    return [...this.sql.exec(
+      `SELECT 1 FROM payments WHERE key_id = ?`,
+      accountId,
+    )].length > 0;
   }
 
   // -- snapshot ------------------------------------------------------------
@@ -227,10 +383,10 @@ export class RegistryStore extends DurableObject {
 async function verifyPayment(env, signature) {
   const price = Number(env.PRICE_USDC || "0");
   const payTo = (env.PAY_TO || "").trim();
-  if (!payTo) return { ok: false, error: "收款地址未配置 (PAY_TO)" };
-  if (!(price > 0)) return { ok: false, error: "价格未配置 (PRICE_USDC)" };
+  if (!payTo) return { ok: false, error: "no receiving address configured (PAY_TO)" };
+  if (!(price > 0)) return { ok: false, error: "price not configured (PRICE_USDC)" };
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,90}$/.test(signature)) {
-    return { ok: false, error: "签名格式不合法" };
+    return { ok: false, error: "signature format is not valid" };
   }
 
   const rpc = env.RPC_FOR_VERIFY || "https://api.mainnet-beta.solana.com";
@@ -248,13 +404,13 @@ async function verifyPayment(env, signature) {
     });
     const body = await res.json();
     tx = body.result;
-    if (body.error) return { ok: false, error: `RPC: ${body.error.message || "查询失败"}` };
+    if (body.error) return { ok: false, error: `RPC: ${body.error.message || "query failed"}` };
   } catch (err) {
-    return { ok: false, error: `RPC 请求失败: ${String(err).slice(0, 80)}` };
+    return { ok: false, error: `RPC request failed: ${String(err).slice(0, 80)}` };
   }
 
-  if (!tx) return { ok: false, error: "链上找不到这笔交易，确认已确认后再试" };
-  if (tx.meta && tx.meta.err) return { ok: false, error: "该交易链上执行失败" };
+  if (!tx) return { ok: false, error: "transaction not found on chain — wait until it confirms, then retry" };
+  if (tx.meta && tx.meta.err) return { ok: false, error: "that transaction failed on chain" };
 
   const usdcMint = env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
   const required = BigInt(Math.round(price * 10 ** USDC_DECIMALS));
@@ -274,7 +430,7 @@ async function verifyPayment(env, signature) {
     const got = Number(received) / 10 ** USDC_DECIMALS;
     return {
       ok: false,
-      error: `收款金额不足：收到 ${got} USDC，需要 ${price} USDC`,
+      error: `insufficient amount received: ${got} USDC (required ${price} USDC)`,
       received: got,
     };
   }
@@ -296,7 +452,7 @@ async function verifyPayment(env, signature) {
 // ------------------------------------------------------------------ routing
 
 async function handleIngest(req, env, store) {
-  if (!env.INGEST_TOKEN) return json({ error: "INGEST_TOKEN 未配置" }, 503);
+  if (!env.INGEST_TOKEN) return json({ error: "INGEST_TOKEN not configured" }, 503);
   if (!timingSafeEqual(bearer(req), env.INGEST_TOKEN)) {
     return json({ error: "unauthorized" }, 401);
   }
@@ -320,6 +476,8 @@ async function handleHealth(env, store) {
       totals = JSON.parse(snap.payload).totals || null;
     } catch { /* keep null */ }
   }
+  // Deliberately thin: this route is public, so it carries outcome counts only.
+  // Scan internals live on /all, which requires an entitled session or key.
   return json({
     status: "ok",
     has_snapshot: Boolean(snap),
@@ -327,9 +485,8 @@ async function handleHealth(env, store) {
     snapshot_received_at: snap?.received_at ?? null,
     stale: age === null ? true : age > 1800,
     totals,
-    stats: await store.stats(),
-    // Public facts the landing page and the sign-up form both need. The
-    // receiving address is a published payment destination, not a secret.
+    // Public facts the sign-up and payment forms both need. The receiving
+    // address is a published payment destination, not a secret.
     pricing: {
       price_usdc: env.PRICE_USDC || "0",
       pay_to: (env.PAY_TO || "").trim(),
@@ -340,44 +497,124 @@ async function handleHealth(env, store) {
   });
 }
 
-async function handlePay(req, env, store) {
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+async function handleRegister(req, store) {
   let body;
   try {
     body = await req.json();
   } catch {
-    return json({ error: "body must be JSON" }, 400);
+    return json({ error: "JSON body required" }, 400);
   }
+  const email = String(body.email || "").trim().toLowerCase();
+  const password = String(body.password || "");
+  if (!EMAIL_RE.test(email) || email.length > 254) {
+    return json({ error: "A valid email address is required" }, 400);
+  }
+  if (password.length < 8) {
+    return json({ error: "Password must be at least 8 characters" }, 400);
+  }
+
+  const created = await store.createAccount(email, password);
+  if (!created.ok) {
+    if (created.error === "EMAIL_TAKEN") {
+      return json({ error: "An account with this email already exists" }, 409);
+    }
+    return json({ error: "could not create account" }, 500);
+  }
+  return json({
+    ok: true,
+    email: created.email,
+    status: created.status,
+    session: created.session,
+    next: "payment", // account exists; entitlement requires paying
+  });
+}
+
+async function handleLogin(req, store) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "JSON body required" }, 400);
+  }
+  const email = String(body.email || "").trim().toLowerCase();
+  const password = String(body.password || "");
+  const result = await store.loginAccount(email, password);
+  if (!result.ok) {
+    // One message for both unknown email and wrong password — don't confirm
+    // which account exists.
+    return json({ error: "Incorrect email or password" }, 401);
+  }
+  return json({
+    ok: true,
+    email: result.email,
+    status: result.status,
+    session: result.session,
+    next: result.status === "active" ? "dashboard" : "payment",
+  });
+}
+
+async function handleAccount(req, store, token) {
+  const account = await store.accountBySession(token);
+  if (!account.ok) return json({ error: "Sign in again", reason: account.reason }, 401);
+  return json({
+    ok: true,
+    email: account.email,
+    status: account.status,
+    entitled: account.status === "active",
+    has_api_key: account.has_api_key,
+    key_expires: account.key_expires,
+  });
+}
+
+async function handlePay(req, env, store, session) {
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "JSON body required" }, 400);
+  }
+
+  const account = await store.accountBySession(session || bearer(req));
+  if (!account.ok) return json({ error: "Sign in first, then pay", reason: account.reason }, 401);
+  if (account.status === "active") {
+    return json({ error: "This account is already activated" }, 409);
+  }
+
   const signature = String(body.signature || "").trim();
-  if (!signature) return json({ error: "缺少 signature" }, 400);
+  if (!signature) return json({ error: "A transaction signature is required" }, 400);
 
   if (await store.hasPayment(signature)) {
-    return json({ error: "这笔交易已经兑换过会员了", signature }, 409);
+    return json({ error: "This signature was already redeemed", signature }, 409);
   }
 
   const verdict = await verifyPayment(env, signature);
   if (!verdict.ok) return json({ error: verdict.error, ...verdict }, 400);
 
-  const days = Number(env.GRANT_DAYS || String(SESSION_DAYS));
-  const issued = await store.createKey(`paid:${signature.slice(0, 12)}`, days);
+  const issued = await store.issueKeyForAccount(account.id);
   await store.recordPayment({
     signature,
     mint: verdict.mint,
     amount: verdict.amount,
     payer: verdict.payer,
-    keyId: issued.id,
+    keyId: account.id,
   });
 
+  const days = Number(env.GRANT_DAYS || String(SESSION_DAYS));
   return json({
     ok: true,
-    api_key: issued.key,
-    expires_at: issued.expires_at,
+    status: "active",
+    email: account.email,
+    api_key: issued.key, // shown once, for programmatic use
+    expires_at: issued.expires,
     days,
-    warning: "这个 key 只显示这一次，请立即保存。",
+    note: "Account activated. The API key is shown only once — copy it now.",
   });
 }
 
 async function handleAdmin(req, env, store) {
-  if (!env.ADMIN_TOKEN) return json({ error: "ADMIN_TOKEN 未配置" }, 503);
+  if (!env.ADMIN_TOKEN) return json({ error: "ADMIN_TOKEN not configured" }, 503);
   if (!timingSafeEqual(bearer(req), env.ADMIN_TOKEN)) {
     return json({ error: "unauthorized" }, 401);
   }
@@ -393,7 +630,7 @@ async function handleAdmin(req, env, store) {
     } catch { /* empty body is fine */ }
     const days = Number(body.days || env.GRANT_DAYS || SESSION_DAYS);
     const issued = await store.createKey(body.label || "manual", days);
-    return json({ ok: true, ...issued, warning: "这个 key 只显示这一次。" });
+    return json({ ok: true, ...issued, warning: "This key is shown only once." });
   }
   if (req.method === "POST" && url.pathname === "/admin/keys/revoke") {
     let body = {};
@@ -401,7 +638,7 @@ async function handleAdmin(req, env, store) {
       body = await req.json();
     } catch { /* fall through to the id check */ }
     const id = Number(body.id);
-    if (!Number.isInteger(id)) return json({ error: "需要整数 id" }, 400);
+    if (!Number.isInteger(id)) return json({ error: "an integer id is required" }, 400);
     return json({ ok: true, key: await store.revokeKey(id) });
   }
   return json({ error: "unknown admin route" }, 404);
@@ -410,14 +647,14 @@ async function handleAdmin(req, env, store) {
 async function handleData(req, env, store, route) {
   const snap = await store.getSnapshot();
   if (!snap) {
-    return json({ error: "还没有收到任何扫描数据", stale: true }, 503);
+    return json({ error: "no scan data has arrived yet", stale: true }, 503);
   }
   const age = nowSec() - snap.received_at;
   let data;
   try {
     data = JSON.parse(snap.payload);
   } catch {
-    return json({ error: "快照损坏" }, 500);
+    return json({ error: "snapshot is corrupt" }, 500);
   }
 
   const url = new URL(req.url);
@@ -481,27 +718,58 @@ export default {
       if (path === "/health" && req.method === "GET") {
         return await handleHealth(env, store);
       }
-      if (path === "/pay" && req.method === "POST") {
-        return await handlePay(req, env, store);
-      }
       if (path === "/" && req.method === "GET") {
         return new Response(DASHBOARD_HTML, {
           headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
         });
       }
+
+      // Account lifecycle: sign up first, pay afterwards.
+      if (path === "/register" && req.method === "POST") {
+        return await handleRegister(req, store);
+      }
+      if (path === "/login" && req.method === "POST") {
+        return await handleLogin(req, store);
+      }
+      if (path === "/account" && req.method === "GET") {
+        return await handleAccount(req, store, bearer(req));
+      }
+      if (path === "/pay" && req.method === "POST") {
+        return await handlePay(req, env, store, bearer(req));
+      }
+
       if (path.startsWith("/admin/")) {
         return await handleAdmin(req, env, store);
       }
+
       if (["/rpc", "/grpc", "/all"].includes(path)) {
         const presented = bearer(req);
         if (!presented) {
-          return json({ error: "需要 API key", hint: "Authorization: Bearer sk_..." }, 401);
+          return json({ error: "Sign in to read endpoints", hint: "Bearer session or sk_ key" }, 401);
         }
-        const verdict = await store.checkKey(presented);
-        if (!verdict.ok) {
-          return json({ error: "API key 无效", reason: verdict.reason }, 401);
+        // Three accepted credentials: an account session (someone paying from
+        // the browser), an account API key (issued on payment), or a
+        // standalone admin-issued key from the api_keys table.
+        const byKey = await store.accountByApiKey(presented);
+        if (byKey.ok) return await handleData(req, env, store, path);
+
+        const bySession = await store.accountBySession(presented);
+        if (bySession.ok) {
+          if (bySession.status !== "active") {
+            return json({ error: "Payment required", reason: "unpaid" }, 402);
+          }
+          return await handleData(req, env, store, path);
         }
-        return await handleData(req, env, store, path);
+
+        const standalone = await store.checkKey(presented);
+        if (standalone.ok) return await handleData(req, env, store, path);
+
+        // Surface the most specific failure we have so the page can tell
+        // "not paid yet" apart from "bad key".
+        const reason = byKey.reason !== "unknown" ? byKey.reason : bySession.reason;
+        if (reason === "unpaid") return json({ error: "Payment required", reason }, 402);
+        if (reason === "expired") return json({ error: "This credential expired", reason }, 401);
+        return json({ error: "Invalid or expired credential", reason }, 401);
       }
       return json({ error: "not found", path }, 404);
     } catch (err) {
@@ -513,7 +781,7 @@ export default {
 // ---------------------------------------------------------------- dashboard
 
 const DASHBOARD_HTML = `<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -522,73 +790,66 @@ const DASHBOARD_HTML = `<!doctype html>
   :root{--bg:#0f1115;--panel:#161a21;--panel2:#1c212a;--line:#262c37;--fg:#e6e9ef;
         --dim:#8b95a7;--faint:#5d667a;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--accent:#60a5fa}
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,
-       BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
        -webkit-font-smoothing:antialiased}
   .wrap{max-width:1180px;margin:0 auto;padding:0 20px 72px}
-  a{color:var(--accent);text-decoration:none}
+  a{color:var(--accent);text-decoration:none;cursor:pointer}
+  a:hover{text-decoration:underline}
   code{background:var(--panel2);border:1px solid var(--line);padding:1px 6px;border-radius:4px;
        font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
   .hide{display:none!important}
 
-  /* ---------- shared chrome ---------- */
   nav{position:sticky;top:0;z-index:20;background:rgba(15,17,21,.88);backdrop-filter:blur(8px);
-      border-bottom:1px solid var(--line);margin-bottom:0}
+      border-bottom:1px solid var(--line)}
   .nav-in{max-width:1180px;margin:0 auto;padding:14px 20px;display:flex;gap:16px;
           align-items:center;justify-content:space-between;flex-wrap:wrap}
   .brand{font-size:15px;font-weight:650;letter-spacing:.2px;white-space:nowrap}
   .brand span{color:var(--dim);font-weight:400}
   .nav-actions{display:flex;gap:9px;align-items:center}
+  .who{font-size:12.5px;color:var(--faint);max-width:230px;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
   button{font:inherit;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
-         border-radius:7px;padding:7px 15px;cursor:pointer;transition:border-color .12s,background .12s}
+         border-radius:7px;padding:7px 15px;cursor:pointer;transition:border-color .12s}
   button:hover{border-color:var(--accent)}
   button.primary{background:var(--accent);border-color:var(--accent);color:#0b1220;font-weight:600}
   button.primary:hover{filter:brightness(1.08)}
+  button.primary:disabled{opacity:.6;cursor:default;filter:none}
   button.ghost{background:transparent;color:var(--dim)}
   button.ghost:hover{color:var(--fg)}
   button.sm{padding:4px 10px;font-size:12px}
+  button.wide{width:100%;padding:11px;font-size:15px}
 
   .status{display:flex;gap:9px;align-items:center;font-size:12.5px;color:var(--dim);white-space:nowrap}
   .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
   .dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(74,222,128,.15)}
   .dot.stale{background:var(--warn);box-shadow:0 0 0 3px rgba(251,191,36,.15)}
 
-  /* ---------- landing ---------- */
+  /* landing */
   .hero{padding:76px 0 54px;text-align:center}
-  .hero h1{font-size:38px;line-height:1.22;margin:0 0 16px;font-weight:680;letter-spacing:-.6px}
+  .hero h1{font-size:40px;line-height:1.2;margin:0 0 17px;font-weight:680;letter-spacing:-.7px}
   .hero h1 em{font-style:normal;color:var(--accent)}
-  .hero p{font-size:16.5px;color:var(--dim);max-width:660px;margin:0 auto 30px;line-height:1.7}
+  .hero p{font-size:17px;color:var(--dim);max-width:640px;margin:0 auto 32px;line-height:1.72}
   .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
   .cta button{padding:12px 26px;font-size:15px}
-  .hero-note{margin-top:16px;font-size:13px;color:var(--faint)}
+  .hero-note{margin-top:17px;font-size:13px;color:var(--faint)}
 
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:8px 0 56px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+         gap:12px;margin:8px 0 56px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:16px 18px}
   .card .k{color:var(--dim);font-size:12.5px;margin-bottom:7px}
   .card .v{font-size:27px;font-weight:660;letter-spacing:-.6px;font-variant-numeric:tabular-nums}
   .card .s{color:var(--faint);font-size:11.5px;margin-top:5px}
 
-  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:14px;margin-bottom:56px}
-  .feat{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:20px 20px 22px}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));
+         gap:14px;margin-bottom:56px}
+  .feat{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:20px}
   .feat h3{margin:0 0 8px;font-size:15.5px;font-weight:640}
   .feat p{margin:0;color:var(--dim);font-size:13.5px;line-height:1.65}
   .ico{font-size:19px;margin-bottom:11px;display:block}
 
-  h2.sec{font-size:21px;margin:0 0 8px;font-weight:650;letter-spacing:-.2px}
-  .sub{color:var(--dim);font-size:14px;margin:0 0 26px}
-  .pricing{background:linear-gradient(155deg,var(--panel),#12161d);
-           border:1px solid var(--line);border-radius:14px;padding:34px 30px;text-align:center;
-           max-width:520px;margin:0 auto}
-  .price{font-size:46px;font-weight:700;letter-spacing:-1.5px;margin:6px 0 2px}
-  .price small{font-size:17px;font-weight:500;color:var(--dim);letter-spacing:0}
-  .price-sub{color:var(--dim);font-size:14px;margin-bottom:22px}
-  .plist{list-style:none;padding:0;margin:22px 0 0;text-align:left;max-width:340px;
-         margin-left:auto;margin-right:auto;font-size:13.5px;color:var(--dim)}
-  .plist li{padding:7px 0;border-bottom:1px solid var(--line);display:flex;gap:10px}
-  .plist li:last-child{border-bottom:none}
-  .plist .yes{color:var(--ok);flex:none}
-
-  .flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:56px}
+  .flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+        gap:14px;margin-bottom:56px}
   .step{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:18px}
   .step .n{display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;
            border-radius:50%;background:var(--accent);color:#0b1220;font-size:12px;
@@ -596,8 +857,21 @@ const DASHBOARD_HTML = `<!doctype html>
   .step h4{margin:0 0 6px;font-size:14.5px}
   .step p{margin:0;color:var(--dim);font-size:13px;line-height:1.6}
 
+  .pricing{background:linear-gradient(155deg,var(--panel),#12161d);
+           border:1px solid var(--line);border-radius:14px;padding:34px 30px;text-align:center;
+           max-width:520px;margin:0 auto}
+  .price{font-size:46px;font-weight:700;letter-spacing:-1.5px;margin:6px 0 2px}
+  .price small{font-size:17px;font-weight:500;color:var(--dim);letter-spacing:0}
+  .price-sub{color:var(--dim);font-size:14px;margin-bottom:22px}
+  .plist{list-style:none;padding:0;margin:22px auto 0;text-align:left;max-width:340px;
+         font-size:13.5px;color:var(--dim)}
+  .plist li{padding:7px 0;border-bottom:1px solid var(--line);display:flex;gap:10px}
+  .plist li:last-child{border-bottom:none}
+  .plist .yes{color:var(--ok);flex:none}
+
+  /* auth panels */
   .cbox{background:var(--panel);border:1px solid var(--line);border-radius:13px;
-        max-width:470px;margin:64px auto 0;padding:30px 30px 32px}
+        max-width:470px;margin:64px auto 0;padding:30px}
   .cbox h2{margin:0 0 7px;font-size:19px;font-weight:650}
   .cbox p.lead{margin:0 0 20px;color:var(--dim);font-size:14px;line-height:1.65}
   .field{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);
@@ -605,13 +879,10 @@ const DASHBOARD_HTML = `<!doctype html>
   .field::placeholder{color:var(--faint)}
   .field:focus{outline:none;border-color:var(--accent)}
   .field.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13.5px}
-  .field.addr{word-break:break-all;font-size:13px}
-  .cbox .primary{width:100%;padding:11px;font-size:15px}
+  .field.addr{word-break:break-all;font-size:12.5px}
   .err{color:var(--bad);font-size:13px;margin-top:12px;min-height:17px}
-  .fine{font-size:12.5px;color:var(--faint);margin-top:17px;line-height:1.7}
-  .fine a{cursor:pointer;text-decoration:underline;text-decoration-color:var(--faint)}
-  .fine a:hover{text-decoration-color:var(--accent)}
-
+  .fine{font-size:12.5px;color:var(--faint);margin-top:17px;line-height:1.8}
+  .hint{font-size:12.5px;color:var(--faint);margin:-4px 0 16px}
   .payrow{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
           padding:11px 13px;margin-bottom:13px}
   .payrow .lbl{font-size:11.5px;color:var(--faint);text-transform:uppercase;
@@ -619,21 +890,20 @@ const DASHBOARD_HTML = `<!doctype html>
   .payrow .val{font-size:14.5px;font-weight:600;font-variant-numeric:tabular-nums}
   .payrow .val.addr{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
                     font-size:12.5px;word-break:break-all;font-weight:500}
-  .muted-notice{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.3);
-                color:var(--warn);border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px}
-
+  .notice{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.3);
+          color:var(--warn);border-radius:8px;padding:11px 13px;font-size:13px;margin-bottom:14px}
+  .notice.info{background:rgba(96,165,250,.07);border-color:rgba(96,165,250,.3);color:var(--accent)}
   .gotkey{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
           padding:15px 16px;margin-bottom:14px}
   .gotkey .lbl{font-size:11.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.5px}
-  .gotkey .kv{font-size:14.5px;font-weight:650;margin-top:5px;word-break:break-all;
+  .gotkey .kv{font-size:14px;font-weight:650;margin-top:5px;word-break:break-all;
               font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ok)}
 
-  /* ---------- app ---------- */
+  /* app */
   .app-head{display:flex;flex-wrap:wrap;gap:16px;align-items:baseline;
             justify-content:space-between;padding:34px 0 22px}
   .app-head h1{font-size:23px;margin:0;font-weight:660;letter-spacing:-.3px}
   .app-head h1 span{color:var(--dim);font-weight:400;font-size:15px}
-
   section{background:var(--panel);border:1px solid var(--line);border-radius:11px;
           margin-bottom:20px;overflow:hidden}
   .sec-head{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;
@@ -667,11 +937,8 @@ const DASHBOARD_HTML = `<!doctype html>
          justify-content:space-between;flex-wrap:wrap}
 
   @media(max-width:640px){
-    .hero{padding:52px 0 40px}
-    .hero h1{font-size:29px}
-    .price{font-size:40px}
-    .cbox{margin-top:44px;padding:24px 20px 26px}
-    .nav-in{padding:12px 16px}
+    .hero{padding:52px 0 40px}.hero h1{font-size:30px}.price{font-size:40px}
+    .cbox{margin-top:44px;padding:24px 20px 26px}.nav-in{padding:12px 16px}
   }
 </style>
 </head>
@@ -680,214 +947,243 @@ const DASHBOARD_HTML = `<!doctype html>
 <nav><div class="nav-in">
   <div class="brand">Solana RPC / gRPC <span>Registry</span></div>
   <div class="nav-actions">
-    <div class="status"><span class="dot" id="dot"></span><span id="age">载入中…</span></div>
-    <button class="ghost sm hide" id="nav-logout">退出</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="age">loading…</span></div>
+    <span class="who hide" id="nav-who"></span>
+    <button class="ghost sm hide" id="nav-logout">Sign out</button>
   </div>
 </div></nav>
 
 <div class="wrap">
 
-<!-- ============================ LANDING ============================ -->
+<!-- ============================== LANDING ============================== -->
 <div id="v-landing">
   <div class="hero">
-    <h1>实测可用的 Solana<br><em>RPC 与 gRPC</em> 端点</h1>
+    <h1>Ready-to-use Solana<br><em>RPC &amp; gRPC endpoints</em></h1>
     <p>
-      每 10 分钟自动扫描全网 ~3800 个验证者节点，只保留真正能用的端点：
-      RPC 必须三个关键方法齐全，gRPC 必须真能推流。
-      按<strong style="color:var(--fg)">推送滞后</strong>排序——不是握手延迟，是你能感觉到的数据到达速度。
+      Stop guessing which public validators will answer. Every endpoint here has
+      been verified as genuinely usable and is refreshed every 10 minutes — you
+      get a short list that works, not a raw directory.
     </p>
     <div class="cta">
-      <button class="primary" onclick="go('register')">注册会员</button>
-      <button onclick="go('login')">已有 key？登录</button>
+      <button class="primary" onclick="go('register')">Create account</button>
+      <button onclick="go('login')">Sign in</button>
     </div>
-    <div class="hero-note">云端托管 · 无免费层 · 需 API key 访问</div>
+    <div class="hero-note">Hosted on Cloudflare · paid access · no free tier</div>
   </div>
 
-  <div class="stats" id="landing-stats">
-    <div class="card"><div class="k">可用 JSON-RPC</div><div class="v" id="s-rpc">—</div>
-      <div class="s" id="s-rpc-sub">加载中…</div></div>
-    <div class="card"><div class="k">可用 Yellowstone gRPC</div><div class="v" id="s-grpc">—</div>
-      <div class="s" id="s-grpc-sub">加载中…</div></div>
-    <div class="card"><div class="k">数据新鲜度</div><div class="v" id="s-age">—</div>
-      <div class="s">每 10 分钟刷新</div></div>
-    <div class="card"><div class="k">扫描规模</div><div class="v" id="s-nodes">—</div>
-      <div class="s">节点 IP</div></div>
+  <div class="stats">
+    <div class="card"><div class="k">Usable JSON-RPC</div><div class="v" id="s-rpc">—</div>
+      <div class="s" id="s-rpc-sub">loading…</div></div>
+    <div class="card"><div class="k">Usable gRPC streams</div><div class="v" id="s-grpc">—</div>
+      <div class="s" id="s-grpc-sub">loading…</div></div>
+    <div class="card"><div class="k">Data freshness</div><div class="v" id="s-age">—</div>
+      <div class="s">updated every 10 minutes</div></div>
+    <div class="card"><div class="k">Delivery</div><div class="v">Edge</div>
+      <div class="s">Cloudflare network</div></div>
   </div>
 
   <div class="grid3">
-    <div class="feat"><span class="ico">📡</span><h3>推送滞后排序</h3>
-      <p>同时打开所有端点的订阅流，取服务端 <code>createdAt</code> 与本地接收时间的差值中位数。
-      这是真实的数据到达延迟，比 GetVersion 往返更接近你实际的使用体感。</p></div>
-    <div class="feat"><span class="ico">🔍</span><h3>严苛的可用性门槛</h3>
-      <p>RPC 必须 <code>getHealth</code> + <code>getLatestBlockhash</code> +
-      <code>getMultipleAccounts</code> 三项全过；很多看着通的端点其实只给 <code>getSlot</code>。
-      gRPC 必须 HTTP/2、返回版本、且真的能收到流数据。</p></div>
-    <div class="feat"><span class="ico">🛡️</span><h3>剔除需要 token 的</h3>
-      <p>需要认证的 gRPC 端点全部丢弃并只保留计数——你拿到的每一行都是能直接连的，
-      不会写到一半才发现要 token。</p></div>
-    <div class="feat"><span class="ico">⚡</span><h3>Cloudflare 边缘访问</h3>
-      <p>扫描与服务解耦。数据由扫描机推送，你从离自己最近的 Cloudflare 节点读取，
-      扫描机本身不承载任何成员请求。</p></div>
-    <div class="feat"><span class="ico">📊</span><h3>内核级 RTT</h3>
-      <p>连接延迟取自内核 TCP_INFO 的 <code>tcpi_rtt</code>，不受进程被调度延迟影响——
-      在已经跑满的机器上，用户态计时会严重失真。</p></div>
-    <div class="feat"><span class="ico">🔁</span><h3>失败自愈</h3>
-      <p>扫描线程对任何异常都兜底，不会因为一次偶发超时就永久停摆。
-      连续失败次数与最后成功时间直接暴露在 <code>/health</code>。</p></div>
+    <div class="feat"><span class="ico">✓</span><h3>Only endpoints that work</h3>
+      <p>A port being open proves nothing. Each listing is verified to answer
+      correctly before it is published, so what you copy is what you get.</p></div>
+    <div class="feat"><span class="ico">📊</span><h3>Ranked by real speed</h3>
+      <p>Endpoints are ordered by how quickly data actually reaches you, so the
+      top of the list is the fastest one to work with in practice.</p></div>
+    <div class="feat"><span class="ico">🔄</span><h3>Always current</h3>
+      <p>Public endpoints go up and down constantly. This one refreshes every
+      10 minutes, and you can see exactly how old the data is.</p></div>
+    <div class="feat"><span class="ico">⚡</span><h3>Served at the edge</h3>
+      <p>Reads come straight from Cloudflare, close to you and worldwide.
+      Collection runs separately, so collection load never reaches you.</p></div>
+    <div class="feat"><span class="ico">🪪</span><h3>One credential, two uses</h3>
+      <p>The same account opens the web console and authenticates your API
+      calls. No separate key to juggle unless you want one.</p></div>
+    <div class="feat"><span class="ico">🛑</span><h3>Nothing unusable gets through</h3>
+      <p>Endpoints that need an access token are excluded outright rather than
+      published as dead ends that fail the moment you connect.</p></div>
   </div>
 
   <div class="flow">
-    <div class="step"><span class="n">1</span><h4>选择套餐</h4>
-      <p>USDC 支付，链上自动核验收款金额，无需人工确认。</p></div>
-    <div class="step"><span class="n">2</span><h4>提交交易签名</h4>
-      <p>把转账后的签名填进去，系统验证链上到账后立即签发 key。</p></div>
-    <div class="step"><span class="n">3</span><h4>拿到 API key</h4>
-      <p>网页登录直接看，或者 <code>Authorization: Bearer sk_...</code> 调接口。</p></div>
+    <div class="step"><span class="n">1</span><h4>Create an account</h4>
+      <p>Email and password. Nothing is charged yet — the account just gives you
+      a place to sign in.</p></div>
+    <div class="step"><span class="n">2</span><h4>Pay once you're in</h4>
+      <p>From inside your account, send USDC and paste the transaction
+      signature. Verification is automatic.</p></div>
+    <div class="step"><span class="n">3</span><h4>Use it</h4>
+      <p>The console unlocks immediately, and you receive an API key for
+      programmatic access.</p></div>
   </div>
 
   <div class="pricing">
     <div class="price">5 <small>USDC</small></div>
-    <div class="price-sub">按 30 天 计 · 按钱包地址发放，可随续</div>
+    <div class="price-sub">per 30 days · billed on-chain</div>
     <ul class="plist">
-      <li><span class="yes">✓</span> 完整 JSON-RPC 列表 + 能力标注</li>
-      <li><span class="yes">✓</span> 完整 Yellowstone gRPC 列表</li>
-      <li><span class="yes">✓</span> 推送滞后 / TCP RTT 双指标排序</li>
-      <li><span class="yes">✓</span> 每 10 分钟更新，边缘节点读取</li>
-      <li><span class="yes">✓</span> 网页控制台 + REST API 同一 key</li>
+      <li><span class="yes">✓</span> Full JSON-RPC list with capability flags</li>
+      <li><span class="yes">✓</span> Full Yellowstone gRPC stream list</li>
+      <li><span class="yes">✓</span> Latency ranking on every row</li>
+      <li><span class="yes">✓</span> Refreshed every 10 minutes</li>
+      <li><span class="yes">✓</span> Web console and REST API with one account</li>
     </ul>
     <div class="cta" style="margin-top:26px">
-      <button class="primary" onclick="go('register')">立即注册</button>
+      <button class="primary" onclick="go('register')">Create account</button>
     </div>
   </div>
 
   <footer>
-    <span>数据来自公开链上观测 · 端点随时可能变化</span>
-    <span>注册遇问题可直接用 <a onclick="go('login')">已有 key 登录</a></span>
+    <span>Endpoints change without notice — check freshness before relying on them.</span>
+    <span>Already a member? <a onclick="go('login')">Sign in</a></span>
   </footer>
 </div>
 
-<!-- ============================ LOGIN ============================ -->
-<div id="v-login" class="hide">
-  <div class="cbox">
-    <h2>登录</h2>
-    <p class="lead">输入你已有的 API key 查看端点列表。</p>
-    <input class="field mono" type="password" id="login-key"
-           placeholder="sk_..." autocomplete="current-password">
-    <button class="primary" id="login-btn">进入</button>
-    <div class="err" id="login-err"></div>
-    <div class="fine">还没有 key？<a onclick="go('register')">去注册 →</a><br>
-      <a onclick="go('landing')">← 返回首页</a></div>
-  </div>
-</div>
-
-<!-- ========================== REGISTER ========================== -->
+<!-- ============================== REGISTER ============================== -->
 <div id="v-register" class="hide">
   <div class="cbox">
-    <h2>注册会员</h2>
-    <p class="lead">支付 5 USDC / 30 天，链上核验到账后立即发 key。</p>
+    <h2>Create account</h2>
+    <p class="lead">Pick your credentials first. You'll pay only after you're signed in.</p>
 
-    <div class="muted-notice hide" id="reg-closed">收款地址尚未配置，注册暂时不可用。</div>
+    <input class="field" type="email" id="rg-email" placeholder="Email" autocomplete="email">
+    <input class="field" type="password" id="rg-pass" placeholder="Password (8+ characters)"
+           autocomplete="new-password">
+    <input class="field" type="password" id="rg-pass2" placeholder="Confirm password"
+           autocomplete="new-password">
+    <button class="wide primary" id="rg-btn">Create account</button>
+    <div class="err" id="rg-err"></div>
 
-    <div id="reg-form">
-      <div class="payrow">
-        <div class="lbl">收款地址 (Solana)</div>
-        <div class="val addr" id="reg-addr">加载中…</div>
-      </div>
-      <div class="payrow">
-        <div class="lbl">金额</div>
-        <div class="val" id="reg-amount">5 USDC</div>
-      </div>
-      <div class="payrow">
-        <div class="lbl">代币</div>
-        <div class="val" style="font-size:13px">USDC</div>
-      </div>
-      <input class="field mono" id="reg-sig"
-             placeholder="粘贴转账后的交易签名…" autocomplete="off">
-      <button class="primary" id="reg-btn">验证到账并获取 key</button>
-      <div class="err" id="reg-err"></div>
-      <div class="fine">
-        签名会被查询主网 <code>getTransaction</code>，比对收款地址 USDC 余额前后差额，
-        同一个签名只能兑换一次。<br>
-        <a onclick="go('login')">已有 key？去登录 →</a><br>
-        <a onclick="go('landing')">← 返回首页</a>
-      </div>
-    </div>
-
-    <div class="hide" id="reg-done">
-      <div class="gotkey">
-        <div class="lbl">你的 API key（只显示这一次）</div>
-        <div class="kv" id="reg-key"></div>
-      </div>
-      <button class="primary" id="reg-use">用这个 key 进入</button>
-      <div class="fine">请立即复制保存。丢失后需要重新兑换或联系管理员补发。</div>
+    <div class="fine">
+      Already have one? <a onclick="go('login')">Sign in</a><br>
+      <a onclick="go('landing')">← Back to overview</a>
     </div>
   </div>
 </div>
 
-<!-- ============================ APP ============================ -->
+<!-- ================================ LOGIN ============================== -->
+<div id="v-login" class="hide">
+  <div class="cbox">
+    <h2>Sign in</h2>
+    <p class="lead">Use the email and password for your account.</p>
+
+    <input class="field" type="email" id="ln-email" placeholder="Email" autocomplete="email">
+    <input class="field" type="password" id="ln-pass" placeholder="Password"
+           autocomplete="current-password">
+    <button class="wide primary" id="ln-btn">Sign in</button>
+    <div class="err" id="ln-err"></div>
+
+    <div class="fine">
+      No account yet? <a onclick="go('register')">Create one</a><br>
+      <a onclick="go('landing')">← Back to overview</a>
+    </div>
+  </div>
+</div>
+
+<!-- ================================ PAY ================================ -->
+<div id="v-pay" class="hide">
+  <div class="cbox">
+    <h2>Activate your account</h2>
+    <p class="lead">Send USDC to the address below, then paste the transaction
+      signature here.</p>
+
+    <div class="notice info" id="pay-welcome"></div>
+    <div class="notice hide" id="pay-closed">
+      Payments are temporarily unavailable. Your account exists — pay later.
+    </div>
+
+    <div id="pay-form">
+      <div class="payrow">
+        <div class="lbl">Send to (Solana)</div>
+        <div class="val addr" id="pay-addr">loading…</div>
+      </div>
+      <div class="payrow">
+        <div class="lbl">Amount</div>
+        <div class="val" id="pay-amount">5 USDC / 30 days</div>
+      </div>
+      <div class="payrow">
+        <div class="lbl">Token</div>
+        <div class="val" style="font-size:13px">USDC</div>
+      </div>
+      <input class="field mono" id="pay-sig" placeholder="Transaction signature"
+             autocomplete="off">
+      <button class="wide primary" id="pay-btn">Verify and activate</button>
+      <div class="err" id="pay-err"></div>
+      <div class="fine">
+        The signature is checked against the network: recipient balance before
+        and after the transaction. One signature activates one account.<br>
+        <a onclick="go('landing')">← Back to overview</a>
+      </div>
+    </div>
+
+    <div class="hide" id="pay-done">
+      <div class="gotkey">
+        <div class="lbl">Your API key — shown once, copy it now</div>
+        <div class="kv" id="pay-key"></div>
+      </div>
+      <button class="wide primary" id="pay-use">Open console</button>
+      <div class="fine">Lost it? We can reissue from your account email.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ================================= APP =============================== -->
 <div id="v-app" class="hide">
   <div class="app-head">
-    <h1>Solana RPC / gRPC <span>· 端点可用性</span></h1>
+    <h1>Solana RPC / gRPC <span>· usable endpoints</span></h1>
     <div class="nav-actions">
-      <button class="sm" id="app-refresh">刷新</button>
-      <button class="sm ghost" id="app-back">首页</button>
+      <button class="sm" id="app-refresh">Refresh</button>
+      <button class="sm ghost" id="app-back">Overview</button>
     </div>
   </div>
 
-  <div class="stats" id="app-stats">
-    <div class="card"><div class="k">可用 RPC</div><div class="v" id="a-rpc">—</div>
+  <div class="stats">
+    <div class="card"><div class="k">Usable RPC</div><div class="v" id="a-rpc">—</div>
       <div class="s" id="a-rpc-sub">—</div></div>
-    <div class="card"><div class="k">可用 gRPC</div><div class="v" id="a-grpc">—</div>
+    <div class="card"><div class="k">Usable gRPC</div><div class="v" id="a-grpc">—</div>
       <div class="s" id="a-grpc-sub">—</div></div>
-    <div class="card"><div class="k">RPC 延迟 P50</div><div class="v" id="a-rp50">—</div>
+    <div class="card"><div class="k">RPC latency P50</div><div class="v" id="a-rp50">—</div>
       <div class="s" id="a-rp50s">—</div></div>
-    <div class="card"><div class="k">推送滞后 P50</div><div class="v" id="a-pp50">—</div>
+    <div class="card"><div class="k">Stream latency P50</div><div class="v" id="a-pp50">—</div>
       <div class="s" id="a-pp50s">—</div></div>
   </div>
 
   <section>
     <div class="sec-head">
       <div><h2>JSON-RPC</h2><div class="meta" id="rpcMeta">—</div></div>
-      <input class="search" id="rpcFilter" placeholder="过滤地址…">
+      <input class="search" id="rpcFilter" placeholder="Filter endpoints…">
     </div>
     <div class="scroll"><table>
       <thead><tr><th class="rank">#</th><th>Endpoint</th>
-        <th style="text-align:right">延迟</th><th>版本</th>
-        <th style="text-align:right">Slot</th><th>能力</th><th></th></tr></thead>
-      <tbody id="rpcBody"><tr><td colspan="7" class="empty">载入中…</td></tr></tbody>
+        <th style="text-align:right">Latency</th><th>Version</th>
+        <th style="text-align:right">Slot</th><th>Capabilities</th><th></th></tr></thead>
+      <tbody id="rpcBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table></div>
   </section>
 
   <section>
     <div class="sec-head">
       <div><h2>Yellowstone gRPC</h2><div class="meta" id="grpcMeta">—</div></div>
-      <input class="search" id="grpcFilter" placeholder="过滤地址…">
+      <input class="search" id="grpcFilter" placeholder="Filter endpoints…">
     </div>
     <div class="scroll"><table>
       <thead><tr><th class="rank">#</th><th>Endpoint</th>
         <th style="text-align:right">TCP</th>
-        <th style="text-align:right">推送滞后</th>
-        <th>版本</th>
-        <th style="text-align:right">流消息</th><th></th></tr></thead>
-      <tbody id="grpcBody"><tr><td colspan="7" class="empty">载入中…</td></tr></tbody>
+        <th style="text-align:right">Stream lag</th>
+        <th>Version</th>
+        <th style="text-align:right">Messages</th><th></th></tr></thead>
+      <tbody id="grpcBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
     </table></div>
   </section>
 
   <div class="note">
-    <b>RPC 可用判定</b>： <code>getHealth</code> + <code>getLatestBlockhash</code> +
-    <code>getMultipleAccounts</code> 三项全过。<br>
-    <b>gRPC 可用判定</b>： HTTP/2 前导通过 → <code>GetVersion</code> 返回版本 →
-    匿名 <code>Subscribe</code> 实际收到流数据。需要 token 的一律剔除。<br>
-    <b>排序</b>： gRPC 按推送滞后（服务端 createdAt 到本地接收的时间差），TCP 作为次级排序。
+    Every row is listed only after a successful verification. Latency is the
+    time it takes for data to reach this page.
   </div>
 </div>
 
 </div>
 
 <script>
-var KEY = sessionStorage.getItem('registry_key') || '';
-var DATA = null, HEAL = null;
-var CURRENT = KEY ? 'app' : 'landing';
+var SESSION = sessionStorage.getItem('registry_session') || '';
+var ACCOUNT = null, DATA = null;
+var CURRENT = SESSION ? 'boot' : 'landing';
 
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
@@ -895,28 +1191,31 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
 function cls(ms,a,b){return ms==null?'muted':(ms<=a?'good':(ms<=b?'mid':'slow'));}
 function fmtAge(s){
   if(s==null)return '—';
-  if(s<60)return Math.round(s)+' 秒前';
-  if(s<3600)return Math.round(s/60)+' 分钟前';
-  return (s/3600).toFixed(1)+' 小时前';
+  if(s<60)return Math.round(s)+' sec ago';
+  if(s<3600)return Math.round(s/60)+' min ago';
+  return (s/3600).toFixed(1)+' hr ago';
 }
-function cardVal(el,txt,sub){
-  if(el)el.textContent=txt;
-  if(sub!=null){var s=$(el.id+'-sub')||$(el.id+'s');if(s)s.textContent=sub;}
+function err(el,msg){$(el).textContent=msg||'';}
+function busy(btn,on,label){
+  btn.disabled=on;
+  if(on){btn.dataset.label=btn.textContent;btn.textContent=label;}
+  else if(btn.dataset.label){btn.textContent=btn.dataset.label;}
 }
 
-/* ---------------- view routing ---------------- */
+/* ---------------- routing ---------------- */
 function go(name){
-  ['landing','login','register','app'].forEach(function(v){
+  ['landing','register','login','pay','app'].forEach(function(v){
     var el=$('v-'+v); if(el)el.classList.toggle('hide', v!==name);
   });
   CURRENT=name;
-  var showLogout = name==='app';
-  $('nav-logout').classList.toggle('hide', !showLogout);
-  document.getElementById('reg-closed');
+  $('nav-logout').classList.toggle('hide', name==='landing'||name==='register'||name==='login');
+  $('nav-who').classList.toggle('hide', !ACCOUNT);
+  if(ACCOUNT) $('nav-who').textContent=ACCOUNT.email;
   window.scrollTo(0,0);
   if(name==='landing')loadHealth();
-  if(name==='register')loadHealth();
-  if(name==='login')setTimeout(function(){$('login-key').focus();},80);
+  if(name==='register')setTimeout(function(){$('rg-email').focus();},80);
+  if(name==='login')setTimeout(function(){$('ln-email').focus();},80);
+  if(name==='pay')loadHealth();
   if(name==='app')load();
 }
 
@@ -924,96 +1223,112 @@ function go(name){
 function loadHealth(){
   return fetch('/health',{cache:'no-store'}).then(function(r){return r.json();})
     .then(function(d){
-      HEAL=d;
       var t=d.totals||{}, p=d.pricing||{};
       $('s-rpc').textContent = t.rpc_usable!=null?t.rpc_usable:'—';
       $('s-rpc-sub').textContent = t.rpc_usable!=null
-        ? '另有 '+t.rpc_partial+' 个方法受限' : '等待首次扫描';
+        ? (t.rpc_partial||0)+' more partially capable' : 'awaiting first run';
       $('s-grpc').textContent = t.grpc_usable!=null?t.grpc_usable:'—';
       $('s-grpc-sub').textContent = t.grpc_usable!=null
-        ? '需 token 的已剔除' : '等待首次扫描';
+        ? 'token-protected ones excluded' : 'awaiting first run';
       $('s-age').textContent = d.has_snapshot?fmtAge(d.snapshot_age_seconds):'—';
-      $('s-nodes').textContent = '3800+';
 
       var dot=$('dot'), ageEl=$('age');
-      if(!d.has_snapshot){dot.className='dot';ageEl.textContent='等待首次扫描';}
-      else if(d.stale){dot.className='dot stale';ageEl.textContent='数据过期 · '+fmtAge(d.snapshot_age_seconds);}
-      else {dot.className='dot ok';ageEl.textContent='新鲜 · '+fmtAge(d.snapshot_age_seconds);}
+      if(!d.has_snapshot){dot.className='dot';ageEl.textContent='awaiting first run';}
+      else if(d.stale){dot.className='dot stale';ageEl.textContent='stale · '+fmtAge(d.snapshot_age_seconds);}
+      else{dot.className='dot ok';ageEl.textContent='fresh · '+fmtAge(d.snapshot_age_seconds);}
 
       if(p.pay_to){
-        $('reg-addr').textContent=p.pay_to;
-        $('reg-amount').textContent=(p.price_usdc||'5')+' USDC / '+(p.grant_days||30)+' 天';
-        $('reg-closed').classList.add('hide');
-        $('reg-form').classList.remove('hide');
+        $('pay-addr').textContent=p.pay_to;
+        $('pay-amount').textContent=(p.price_usdc||'5')+' USDC / '+(p.grant_days||30)+' days';
+        $('pay-closed').classList.add('hide');
+        $('pay-form').classList.remove('hide');
       }else{
-        $('reg-closed').classList.remove('hide');
-        $('reg-form').classList.add('hide');
+        $('pay-closed').classList.remove('hide');
+        $('pay-form').classList.add('hide');
       }
     }).catch(function(){});
 }
 
-/* ---------------- login ---------------- */
-function doLogin(){
-  var v=$('login-key').value.trim();
-  if(!v){$('login-err').textContent='请输入 API key';return;}
-  $('login-err').textContent='';
-  $('login-btn').disabled=true;
-  fetch('/all',{headers:{'authorization':'Bearer '+v},cache:'no-store'})
-    .then(function(r){
-      $('login-btn').disabled=false;
-      if(r.status===401){$('login-err').textContent='key 无效或已过期';return;}
-      if(!r.ok){$('login-err').textContent='服务暂时不可用 (HTTP '+r.status+')';return;}
-      return r.json().then(function(d){
-        KEY=v; sessionStorage.setItem('registry_key',v);
-        $('login-key').value='';
-        go('app');
-      });
-    })
-    .catch(function(e){$('login-btn').disabled=false;
-      $('login-err').textContent='网络错误';});
+/* ---------------- register / login ---------------- */
+function doRegister(){
+  var email=$('rg-email').value.trim(), pw=$('rg-pass').value, pw2=$('rg-pass2').value;
+  err('rg-err','');
+  if(!email){err('rg-err','Enter your email');return;}
+  if(pw.length<8){err('rg-err','Password must be at least 8 characters');return;}
+  if(pw!==pw2){err('rg-err','Passwords do not match');return;}
+  busy($('rg-btn'),true,'Creating…');
+  fetch('/register',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({email:email,password:pw})})
+    .then(function(r){return r.json().then(function(d){
+      busy($('rg-btn'),false);
+      if(!r.ok){err('rg-err',d.error||('HTTP '+r.status));return;}
+      SESSION=d.session; sessionStorage.setItem('registry_session',SESSION);
+      ACCOUNT={email:d.email,status:d.status};
+      $('rg-pass').value=''; $('rg-pass2').value='';
+      enterAfterAuth(d);
+    });})
+    .catch(function(){busy($('rg-btn'),false);err('rg-err','Network error');});
 }
 
-/* ---------------- register ---------------- */
-function doRegister(){
-  var sig=$('reg-sig').value.trim();
-  if(!sig){$('reg-err').textContent='请填写交易签名';return;}
-  $('reg-err').textContent='';
-  $('reg-btn').disabled=true;
-  $('reg-btn').textContent='验证中…';
-  fetch('/pay',{method:'POST',headers:{'content-type':'application/json'},
+function doLogin(){
+  var email=$('ln-email').value.trim(), pw=$('ln-pass').value;
+  err('ln-err','');
+  if(!email||!pw){err('ln-err','Enter your email and password');return;}
+  busy($('ln-btn'),true,'Signing in…');
+  fetch('/login',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({email:email,password:pw})})
+    .then(function(r){return r.json().then(function(d){
+      busy($('ln-btn'),false);
+      if(!r.ok){err('ln-err',d.error||('HTTP '+r.status));return;}
+      SESSION=d.session; sessionStorage.setItem('registry_session',SESSION);
+      ACCOUNT={email:d.email,status:d.status};
+      $('ln-pass').value='';
+      enterAfterAuth(d);
+    });})
+    .catch(function(){busy($('ln-btn'),false);err('ln-err','Network error');});
+}
+
+function enterAfterAuth(d){
+  if(d.status==='active'){go('app');return;}
+  $('pay-welcome').textContent='Signed in as '+d.email+'. Account is not active yet.';
+  go('pay');
+}
+
+/* ---------------- payment ---------------- */
+function doPay(){
+  var sig=$('pay-sig').value.trim();
+  err('pay-err','');
+  if(!sig){err('pay-err','Paste the transaction signature');return;}
+  busy($('pay-btn'),true,'Verifying…');
+  fetch('/pay',{method:'POST',headers:{'content-type':'application/json',
+      'authorization':'Bearer '+SESSION},
     body:JSON.stringify({signature:sig})})
     .then(function(r){return r.json().then(function(d){
-      $('reg-btn').disabled=false;
-      $('reg-btn').textContent='验证到账并获取 key';
-      if(!r.ok){$('reg-err').textContent=d.error||('HTTP '+r.status);return;}
-      $('reg-form').classList.add('hide');
-      $('reg-done').classList.remove('hide');
-      $('reg-key').textContent=d.api_key;
-      sessionStorage.setItem('pending_key',d.api_key);
+      busy($('pay-btn'),false);
+      if(!r.ok){err('pay-err',d.error||('HTTP '+r.status));return;}
+      ACCOUNT.status='active';
+      $('pay-form').classList.add('hide');
+      $('pay-done').classList.remove('hide');
+      $('pay-key').textContent=d.api_key||'(issued after refresh)';
+      if(d.api_key)sessionStorage.setItem('registry_apikey',d.api_key);
+      $('nav-who').textContent=(ACCOUNT.email||'')+' · active';
     });})
-    .catch(function(){$('reg-btn').disabled=false;
-      $('reg-btn').textContent='验证到账并获取 key';
-      $('reg-err').textContent='网络错误';});
+    .catch(function(){busy($('pay-btn'),false);err('pay-err','Network error');});
 }
 
-function useNewKey(){
-  var v=sessionStorage.getItem('pending_key');
-  if(!v)return;
-  sessionStorage.removeItem('pending_key');
-  KEY=v; sessionStorage.setItem('registry_key',v);
-  $('reg-sig').value='';
-  $('reg-done').classList.add('hide');
-  $('reg-form').classList.remove('hide');
-  go('app');
-}
+function useSession(){go('app');}
 
 /* ---------------- app data ---------------- */
 function load(){
-  if(!KEY){go('login');return;}
-  return fetch('/all',{headers:{'authorization':'Bearer '+KEY},cache:'no-store'})
+  if(!SESSION){go('login');return;}
+  return fetch('/all',{headers:{'authorization':'Bearer '+SESSION},cache:'no-store'})
     .then(function(r){
-      if(r.status===401){sessionStorage.removeItem('registry_key');KEY='';
-        go('login');return;}
+      if(r.status===401){signOut();return;}
+      if(r.status===402){
+        ACCOUNT=ACCOUNT||{};
+        $('pay-welcome').textContent='Signed in as '+(ACCOUNT.email||'you')+'. Account is not active yet.';
+        go('pay');return;
+      }
       if(!r.ok)throw new Error('HTTP '+r.status);
       return r.json();
     })
@@ -1023,27 +1338,26 @@ function load(){
 
 function render(){
   if(!DATA)return;
-  var ageSec=DATA.snapshot_age_seconds, fresh=!DATA.stale;
+  var fresh=!DATA.stale;
   $('dot').className='dot '+(fresh?'ok':'stale');
-  $('age').textContent=(fresh?'新鲜 · ':'数据过期 · ')+fmtAge(ageSec);
+  $('age').textContent=(fresh?'fresh · ':'stale · ')+fmtAge(DATA.snapshot_age_seconds);
 
   var t=DATA.totals||{}, r=DATA.rpc||{}, g=DATA.grpc||{};
   var rl=r.latency_ms||{}, pl=g.push_lag_ms||{};
   $('a-rpc').textContent=t.rpc_usable!=null?t.rpc_usable:'—';
-  $('a-rpc-sub').textContent='另有 '+(t.rpc_partial||0)+' 个方法受限';
+  $('a-rpc-sub').textContent=(t.rpc_partial||0)+' partially capable';
   $('a-grpc').textContent=t.grpc_usable!=null?t.grpc_usable:'—';
-  $('a-grpc-sub').textContent='h2c 候选 '+((g.counts||{}).h2c||0);
+  $('a-grpc-sub').textContent='live stream verified';
   $('a-rp50').textContent=rl.p50!=null?rl.p50+'ms':'—';
   $('a-rp50s').textContent=rl.min!=null?'min '+rl.min+'ms':'—';
   $('a-pp50').textContent=pl.p50!=null?pl.p50+'ms':'—';
   $('a-pp50s').textContent=pl.min!=null?'min '+pl.min+'ms':'—';
 
-  var rc=r.counts||{}, gc=g.counts||{};
+  var rc=r.counts||{};
   $('rpcMeta').textContent=
-    rc.usable+' 可用 / '+rc.healthy+' 健康 / '+rc.advertised+' 广告 · '+(r.scan_seconds||0)+'s';
+    rc.usable+' usable · '+(rc.advertised||0)+' monitored';
   $('grpcMeta').textContent=
-    (gc.subscribe_ok||0)+' 订阅通过 / '+(gc.getversion_ok||0)+' GetVersion / '+
-    (gc.cluster_ips||0)+' 节点 · '+(gc.race_slots||0)+' 条样本';
+    (g.counts||{}).subscribe_ok+' streams verified';
 
   renderRpc(r.endpoints||[]);
   renderGrpc(g.endpoints||[]);
@@ -1062,8 +1376,8 @@ function renderRpc(rows){
       '<td>'+esc(e.version||'—')+'</td>'+
       '<td class="num muted">'+esc(e.slot||'—')+'</td>'+
       '<td class="muted">'+esc(caps.join(', ')||'—')+'</td>'+
-      '<td><button class="copy" data-v="'+esc(e.endpoint)+'">复制</button></td></tr>';
-  }).join('') : '<tr><td colspan="7" class="empty">没有匹配的 RPC</td></tr>';
+      '<td><button class="copy" data-v="'+esc(e.endpoint)+'">Copy</button></td></tr>';
+  }).join('') : '<tr><td colspan="7" class="empty">No matching RPC endpoints</td></tr>';
 }
 
 function renderGrpc(rows){
@@ -1078,37 +1392,63 @@ function renderGrpc(rows){
         (e.push_lag_ms!=null?e.push_lag_ms+'ms':'—')+'</td>'+
       '<td>'+esc(e.version||'—')+'</td>'+
       '<td class="num muted">'+(e.stream_messages!=null?e.stream_messages:'—')+'</td>'+
-      '<td><button class="copy" data-v="'+esc(e.endpoint)+'">复制</button></td></tr>';
-  }).join('') : '<tr><td colspan="7" class="empty">没有匹配的 gRPC</td></tr>';
+      '<td><button class="copy" data-v="'+esc(e.endpoint)+'">Copy</button></td></tr>';
+  }).join('') : '<tr><td colspan="7" class="empty">No matching gRPC endpoints</td></tr>';
+}
+
+function signOut(){
+  SESSION=''; ACCOUNT=null; DATA=null;
+  sessionStorage.removeItem('registry_session');
+  $('ln-email').value=''; $('ln-pass').value='';
+  go('landing');
 }
 
 /* ---------------- wiring ---------------- */
-$('login-btn').addEventListener('click',doLogin);
-$('login-key').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
-$('reg-btn').addEventListener('click',doRegister);
-$('reg-use').addEventListener('click',useNewKey);
-$('reg-sig').addEventListener('keydown',function(e){if(e.key==='Enter')doRegister();});
+$('rg-btn').addEventListener('click',doRegister);
+$('rg-pass2').addEventListener('keydown',function(e){if(e.key==='Enter')doRegister();});
+$('ln-btn').addEventListener('click',doLogin);
+$('ln-pass').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
+$('pay-btn').addEventListener('click',doPay);
+$('pay-sig').addEventListener('keydown',function(e){if(e.key==='Enter')doPay();});
+$('pay-use').addEventListener('click',useSession);
 $('app-refresh').addEventListener('click',load);
 $('app-back').addEventListener('click',function(){go('landing');});
-$('nav-logout').addEventListener('click',function(){
-  sessionStorage.removeItem('registry_key');KEY='';go('landing');});
+$('nav-logout').addEventListener('click',signOut);
 $('rpcFilter').addEventListener('input',function(){if(DATA)renderRpc(DATA.rpc.endpoints||[]);});
 $('grpcFilter').addEventListener('input',function(){if(DATA)renderGrpc(DATA.grpc.endpoints||[]);});
 document.addEventListener('click',function(ev){
   var b=ev.target.closest&&ev.target.closest('.copy');
   if(!b)return;
-  var text=b.getAttribute('data-v');
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(function(){
-      var o=b.textContent;b.textContent='已复制';
-      setTimeout(function(){b.textContent=o;},1200);
-    });
-  }
+  if(!navigator.clipboard)return;
+  navigator.clipboard.writeText(b.getAttribute('data-v')).then(function(){
+    var o=b.textContent;b.textContent='Copied';
+    setTimeout(function(){b.textContent=o;},1200);
+  });
 });
 
-if(KEY){go('app');}else{go('landing');}
-setInterval(function(){if(CURRENT==='landing'||CURRENT==='register')loadHealth();
-  if(CURRENT==='app')load();},60000);
+/* boot: if a stored session still works, land straight in the console */
+function boot(){
+  if(!SESSION){go('landing');return;}
+  fetch('/account',{headers:{'authorization':'Bearer '+SESSION},cache:'no-store'})
+    .then(function(r){return r.ok?r.json():null;})
+    .then(function(d){
+      if(!d||!d.ok){SESSION='';sessionStorage.removeItem('registry_session');go('landing');return;}
+      ACCOUNT={email:d.email,status:d.status};
+      $('nav-who').classList.remove('hide');
+      $('nav-who').textContent=d.email+(d.entitled?' · active':' · unpaid');
+      if(d.status==='active'){go('app');}else{
+        $('pay-welcome').textContent='Signed in as '+d.email+'. Account is not active yet.';
+        go('pay');
+      }
+    })
+    .catch(function(){go('landing');});
+}
+boot();
+setInterval(function(){
+  if(CURRENT==='landing')loadHealth();
+  if(CURRENT==='pay')loadHealth();
+  if(CURRENT==='app')load();
+},60000);
 </script>
 </body>
 </html>`;
