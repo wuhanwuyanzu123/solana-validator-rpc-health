@@ -27,11 +27,13 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -201,10 +203,12 @@ DASHBOARD_HTML = r"""<!doctype html>
       <table>
         <thead><tr>
           <th class="rank">#</th><th>Endpoint</th>
-          <th style="text-align:right">TCP</th><th style="text-align:right">GetVersion</th>
+          <th style="text-align:right">TCP</th>
+          <th style="text-align:right" title="服务端 createdAt 到本地接收的时间差，越小越快">推送滞后</th>
+          <th style="text-align:right">GetVersion</th>
           <th>版本</th><th style="text-align:right">流消息</th><th></th>
         </tr></thead>
-        <tbody id="grpcBody"><tr><td colspan="7" class="empty">载入中…</td></tr></tbody>
+        <tbody id="grpcBody"><tr><td colspan="8" class="empty">载入中…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -275,7 +279,7 @@ function render() {
 
   var t = DATA.totals || {};
   var r = DATA.rpc || {}, g = DATA.grpc || {};
-  var rl = r.latency_ms || {}, gl = g.latency_ms || {};
+  var rl = r.latency_ms || {}, gl = g.latency_ms || {}, pl = g.push_lag_ms || {};
   document.getElementById('cards').innerHTML =
     card('可用 RPC', t.rpc_usable != null ? t.rpc_usable : '—',
          '部分可用 ' + (t.rpc_partial || 0)) +
@@ -283,8 +287,8 @@ function render() {
          'h2c 候选 ' + ((g.counts || {}).h2c || 0)) +
     card('RPC P50', rl.p50 != null ? rl.p50 + 'ms' : '—',
          'min ' + (rl.min != null ? rl.min + 'ms' : '—')) +
-    card('gRPC P50', gl.p50 != null ? gl.p50 + 'ms' : '—',
-         'min ' + (gl.min != null ? gl.min + 'ms' : '—'));
+    card('gRPC 推送滞后 P50', pl.p50 != null ? pl.p50 + 'ms' : '—',
+         pl.min != null ? 'min ' + pl.min + 'ms' : 'TCP P50 ' + (gl.p50 != null ? gl.p50 + 'ms' : '—'));
 
   var rc = r.counts || {};
   document.getElementById('rpcMeta').textContent =
@@ -293,7 +297,8 @@ function render() {
   var gc = g.counts || {};
   document.getElementById('grpcMeta').textContent =
     (gc.subscribe_ok || 0) + ' 订阅通过 / ' + (gc.getversion_ok || 0) + ' GetVersion / ' +
-    (gc.h2c || 0) + ' h2c / ' + (gc.cluster_ips || 0) + ' 节点 · 扫描 ' +
+    (gc.h2c || 0) + ' h2c / ' + (gc.cluster_ips || 0) + ' 节点 · ' +
+    (gc.race_slots || 0) + ' 条样本 / ' + (gc.race_seconds || 0) + 's · 扫描 ' +
     (g.scan_seconds || 0) + 's';
 
   renderRpc(r.endpoints || []);
@@ -331,7 +336,7 @@ function renderGrpc(rows) {
   var out = rows.filter(function (e) { return !q || e.endpoint.toLowerCase().indexOf(q) >= 0; });
   if (!out.length) {
     document.getElementById('grpcBody').innerHTML =
-      '<tr><td colspan="7" class="empty">没有匹配的可用 gRPC</td></tr>';
+      '<tr><td colspan="8" class="empty">没有匹配的可用 gRPC</td></tr>';
     return;
   }
   document.getElementById('grpcBody').innerHTML = out.map(function (e, i) {
@@ -340,6 +345,9 @@ function renderGrpc(rows) {
       '<td class="ep">' + esc(e.endpoint) + '</td>' +
       '<td class="num ' + cls(e.tcp_ms, 5, 30) + '">' +
         (e.tcp_ms != null ? e.tcp_ms + 'ms' : '—') + '</td>' +
+      '<td class="num ' + cls(e.push_lag_ms, 10, 50) + '" title="' +
+        (e.push_slots || 0) + ' 条样本">' +
+        (e.push_lag_ms != null ? e.push_lag_ms + 'ms' : '—') + '</td>' +
       '<td class="num ' + cls(e.getversion_ms, 60, 200) + '">' +
         (e.getversion_ms != null ? e.getversion_ms + 'ms' : '—') + '</td>' +
       '<td>' + esc(e.version || '—') + '</td>' +
@@ -645,17 +653,44 @@ def cluster_ips(cluster_rpc: str, timeout: float) -> list[str]:
     return list(seen)
 
 
+TCPI_RTT_OFFSET = 68
+
+
+def kernel_rtt_ms(sock: socket.socket) -> float | None:
+    """RTT sample the kernel stamped at packet arrival (TCP_INFO.tcpi_rtt).
+
+    Immune to our process being descheduled after connect() returns, which
+    otherwise inflates userspace wall-clock timing on a loaded box. This host
+    already runs several services near saturation, so the wall-clock reading
+    alone is not trustworthy.
+    """
+    if not hasattr(socket, "TCP_INFO"):
+        return None
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 128)
+    except OSError:
+        return None
+    if len(raw) < TCPI_RTT_OFFSET + 4:
+        return None
+    rtt_us = struct.unpack_from("@I", raw, TCPI_RTT_OFFSET)[0]
+    return rtt_us / 1000.0 if rtt_us else None
+
+
 def tcp_connect_ms(ip: str, port: int, timeout: float) -> float | None:
     sock = socket.socket()
     sock.settimeout(timeout)
     started = time.perf_counter()
     try:
         sock.connect((ip, port))
-        return round((time.perf_counter() - started) * 1000, 1)
     except OSError:
-        return None
-    finally:
         sock.close()
+        return None
+    wall_ms = (time.perf_counter() - started) * 1000
+    kernel_ms = kernel_rtt_ms(sock)
+    sock.close()
+    if kernel_ms is not None:
+        return round(kernel_ms, 1)
+    return round(wall_ms, 1)
 
 
 def h2c_probe(ip: str, port: int, timeout: float) -> bool:
@@ -747,6 +782,125 @@ def grpc_subscribe(ip: str, port: int, proto_dir: str, proto_file: str, timeout:
     return {"status": "FAIL", "detail": out[:200]}
 
 
+# Every Yellowstone SubscribeUpdate carries the server's own generation time:
+#   { "slot": {...}, "createdAt": "2026-07-09T12:56:41.459131652Z", ... }
+# Standard lag = local receive wall-clock minus createdAt (message age in ms).
+# Absolute values need NTP on this host; ranking stays fair either way because
+# every endpoint is compared with the same local clock.
+CREATED_AT_RE = re.compile(r'"createdAt"\s*:\s*"([^"]+)"')
+
+
+def _parse_created_at(value: str) -> float | None:
+    # RFC3339 with nanoseconds; datetime takes microseconds, so truncate.
+    try:
+        if value.endswith("Z"):
+            value = value[:-1]
+        if "." in value:
+            head, frac = value.split(".", 1)
+            dt = datetime.strptime(
+                "%s.%s" % (head, (frac + "000000")[:6]), "%Y-%m-%dT%H:%M:%S.%f"
+            )
+        else:
+            dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def measure_push_lag(
+    endpoints: list[dict[str, Any]],
+    proto_dir: str,
+    proto_file: str,
+    args: argparse.Namespace,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """createdAt message-age lag on simultaneous Subscribe streams.
+
+    Opens a stream on every usable endpoint, and for each message computes
+    local_wall_clock - server_createdAt (ms). The per-endpoint median is the
+    push lag: network plus server queueing, at millisecond resolution -- finer
+    than a slot race (400ms granularity) and independent of other endpoints.
+    """
+    if not endpoints or args.push_race_seconds <= 0:
+        return {}, {}
+
+    duration = args.push_race_seconds
+    lags: dict[str, list[float]] = {}
+    procs: dict[str, subprocess.Popen] = {}
+    readers: list[threading.Thread] = []
+    lock = threading.Lock()
+
+    def _reader(name: str, stream: Any) -> None:
+        try:
+            for raw in iter(stream.readline, ""):
+                match = CREATED_AT_RE.search(raw)
+                if not match:
+                    continue
+                created = _parse_created_at(match.group(1))
+                if created is None:
+                    continue
+                age_ms = (time.time() - created) * 1000
+                # Reject clock-skew outliers and stale buffered garbage.
+                if -1000 <= age_ms <= 60000:
+                    with lock:
+                        lags[name].append(age_ms)
+        except (OSError, ValueError):
+            pass
+
+    # Stagger launches so the grpcurl cold starts (CPU-heavy proto parse) do not
+    # all land on the cores at once; late starters merely miss the first slots,
+    # which the aggregation below already skips.
+    for ep in endpoints:
+        name = ep["endpoint"]
+        lags[name] = []
+        try:
+            proc = subprocess.Popen(
+                [
+                    "grpcurl", "-plaintext",
+                    "-import-path", proto_dir,
+                    "-proto", proto_file,
+                    "-max-time", str(duration + 8),
+                    "-d", SUBSCRIBE_PAYLOAD,
+                    f"{ep['host']}:{ep['port']}",
+                    "geyser.Geyser/Subscribe",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
+            continue
+        procs[name] = proc
+        if proc.stdout is not None:
+            thread = threading.Thread(target=_reader, args=(name, proc.stdout), daemon=True)
+            thread.start()
+            readers.append(thread)
+        time.sleep(0.1)
+
+    time.sleep(duration)
+
+    for proc in procs.values():
+        proc.terminate()
+    for proc in procs.values():
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    for thread in readers:
+        thread.join(timeout=2)
+
+    results: dict[str, dict[str, Any]] = {}
+    total_messages = 0
+    for name in procs:
+        vals = sorted(lags.get(name, []))
+        total_messages += len(vals)
+        results[name] = {
+            "push_lag_ms": round(vals[len(vals) // 2], 1) if vals else None,
+            "push_slots": len(vals),
+        }
+    return results, {"slots": total_messages, "seconds": duration}
+
+
 def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict[str, Any]:
     started = time.time()
     ports = [int(p) for p in args.grpc_ports.split(",") if p.strip().isdigit()]
@@ -775,9 +929,16 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
 
     versioned: list[dict[str, Any]] = []
     auth_required: list[str] = []
+
+    def _probe_version(ip: str, port: int) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = grpc_get_version(ip, port, proto_dir, proto_file, args.grpc_timeout)
+        result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return result
+
     with ThreadPoolExecutor(max_workers=args.grpc_parallel) as pool:
         futures = {
-            pool.submit(grpc_get_version, ip, port, proto_dir, proto_file, args.grpc_timeout): (ip, port)
+            pool.submit(_probe_version, ip, port): (ip, port)
             for ip, port in candidates
         }
         for future in as_completed(futures):
@@ -788,7 +949,14 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
                 continue
             if result["status"] != "OK":
                 continue
-            versioned.append({"host": ip, "port": port, "version": result.get("version", "")})
+            versioned.append({
+                "host": ip,
+                "port": port,
+                "version": result.get("version", ""),
+                # Carried into _verify_grpc so the verify stage does not pay a
+                # second grpcurl cold start per endpoint.
+                "getversion_ms": result.get("elapsed_ms"),
+            })
 
     # GetVersion gates the expensive part; only stream-verified rows are usable.
     verified: list[dict[str, Any]] = []
@@ -802,8 +970,26 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
             if entry is not None:
                 verified.append(entry)
 
-    verified.sort(key=lambda r: (r["getversion_ms"] is None, r["getversion_ms"] or 0))
-    latencies = [r["getversion_ms"] for r in verified if r["getversion_ms"] is not None]
+    # Real push latency: simultaneous streams, createdAt message age per message.
+    race_info: dict[str, Any] = {}
+    race: dict[str, dict[str, Any]] = {}
+    if len(verified) >= 2:
+        race, race_info = measure_push_lag(verified, proto_dir, proto_file, args)
+    for row in verified:
+        info = race.get(row["endpoint"], {})
+        row["push_lag_ms"] = info.get("push_lag_ms")
+        row["push_slots"] = info.get("push_slots", 0)
+
+    # Rank by measured push lag; fall back to kernel-stamped TCP RTT when the
+    # lag sample came back empty for some endpoint.
+    verified.sort(key=lambda r: (
+        r.get("push_lag_ms") is None,
+        r.get("push_lag_ms") or 0,
+        r["tcp_ms"] is None,
+        r["tcp_ms"] or 0,
+    ))
+    latencies = [r["tcp_ms"] for r in verified if r["tcp_ms"] is not None]
+    push_lags = [r["push_lag_ms"] for r in verified if r.get("push_lag_ms") is not None]
 
     return {
         "scanned_at": time.time(),
@@ -817,8 +1003,11 @@ def scan_grpc(args: argparse.Namespace, proto_dir: str, proto_file: str) -> dict
             # cannot use them, so only the count is worth reporting.
             "auth_required_dropped": len(auth_required),
             "subscribe_ok": len(verified),
+            "race_slots": race_info.get("slots", 0),
+            "race_seconds": race_info.get("seconds", 0),
         },
         "latency_ms": _percentiles(latencies),
+        "push_lag_ms": _percentiles(push_lags),
         "endpoints": verified,
         "ports": ports,
     }
@@ -835,12 +1024,7 @@ def _verify_grpc(
     if tcp is None:
         return None
 
-    started = time.perf_counter()
-    version = grpc_get_version(ip, port, proto_dir, proto_file, args.grpc_timeout)
-    gv_ms = round((time.perf_counter() - started) * 1000, 1)
-    if version["status"] != "OK":
-        return None
-
+    # GetVersion already ran (and was timed) in scan_grpc; only Subscribe here.
     subscribe = grpc_subscribe(ip, port, proto_dir, proto_file, args.subscribe_timeout)
     if subscribe["status"] != "OK":
         return None
@@ -850,8 +1034,8 @@ def _verify_grpc(
         "host": ip,
         "port": port,
         "tcp_ms": tcp,
-        "getversion_ms": gv_ms,
-        "version": entry.get("version") or version.get("version", ""),
+        "getversion_ms": entry.get("getversion_ms"),
+        "version": entry.get("version", ""),
         "subscribe": subscribe["status"],
         "stream_messages": subscribe.get("messages", 0),
         "usable": True,
@@ -1162,13 +1346,18 @@ def build_parser() -> argparse.ArgumentParser:
                         default="So11111111111111111111111111111111111111112",
                         help="pubkey used to test getMultipleAccounts support")
     parser.add_argument("--rpc-timeout", type=float, default=3.0)
-    parser.add_argument("--rpc-parallel", type=int, default=64)
+    # Tuned for the 4-core host the service runs on, where several trading
+    # services already sit near saturation. The old 64/300/16 defaults starved
+    # the probes themselves and inflated timings by seconds.
+    parser.add_argument("--rpc-parallel", type=int, default=16)
     parser.add_argument("--tcp-timeout", type=float, default=0.5)
-    parser.add_argument("--sweep-parallel", type=int, default=300)
+    parser.add_argument("--sweep-parallel", type=int, default=64)
     parser.add_argument("--grpc-timeout", type=float, default=8.0)
     parser.add_argument("--subscribe-timeout", type=float, default=4.0,
                         help="seconds to hold a Subscribe stream open before closing it")
-    parser.add_argument("--grpc-parallel", type=int, default=16)
+    parser.add_argument("--grpc-parallel", type=int, default=3)
+    parser.add_argument("--push-race-seconds", type=float, default=10.0,
+                        help="seconds to sample createdAt push lag per endpoint; 0 disables")
     parser.add_argument("--scan-timeout", type=float, default=300.0,
                         help="hard cap on one RPC scan invocation")
     parser.add_argument("--no-scan", action="store_true",
