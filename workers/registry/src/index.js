@@ -764,6 +764,19 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const store = env.STORE.get(env.STORE.idFromName("main"));
 
+    // Crawlers and health checks commonly probe with HEAD. Implementing only
+    // GET made every such probe a 404 even though the page itself serves.
+    if (req.method === "HEAD" && path === "/") {
+      // Headers only: a HEAD response must not carry a body.
+      return new Response(null, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-length": String(DASHBOARD_HTML.length),
+          "cache-control": "no-store",
+        },
+      });
+    }
+
     if (req.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
