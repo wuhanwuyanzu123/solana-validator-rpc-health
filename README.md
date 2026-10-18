@@ -48,49 +48,47 @@ Scan and verify whether a Yellowstone/Solana gRPC endpoint is actually usable:
 python3 bin/solana-validator-rpc-health.py --scan-host YOUR_VALIDATOR_HOST --port-range 1-10000 --grpc-token YOUR_TOKEN
 ```
 
-## Registry Service (scan on a timer + HTTP API)
+## Registry (scan host + Cloudflare)
 
-`bin/rpc_grpc_registry.py` runs the scan on an interval and exposes the latest
-snapshot over HTTP so other services can discover endpoints that actually work.
-No package dependencies; stdlib only.
+The scanner and the API are two separate things.
 
-```bash
-python3 bin/rpc_grpc_registry.py --port 8090 --interval 600 \
-  --password-file /root/.rpc-registry-password
+```text
+82.23.138.51   runs the scan every 600s and publishes the snapshot
+      ↓ push
+Cloudflare     serves the console and the JSON endpoints to members
 ```
 
-All routes require authentication. Open `http://HOST:8090/` in a browser and it
-prompts for credentials; the page then auto-refreshes every 30 seconds with
-per-endpoint copy buttons and latency color coding. The HTML is served by the
-same process, so no separate web server is needed.
+`bin/rpc_grpc_registry.py --no-serve` scans and pushes but binds no port — members
+read the Cloudflare Worker, so the scan host publishes nothing itself. That also
+matters on a box with no firewall, where any `0.0.0.0` listener is immediately
+internet-facing. Stdlib only, no package dependencies.
 
 ```bash
-# browser-style
-curl -u admin:PASSWORD http://HOST:8090/health
-
-# service-style
-curl -H "Authorization: Bearer PASSWORD" http://HOST:8090/grpc?limit=5
+python3 bin/rpc_grpc_registry.py --no-serve --interval 600   --push-race-seconds 10   --push-url https://solana-rpc-registry.lwhch888.workers.dev   --push-token-file /root/.cf-ingest-token
 ```
+
+### Worker routes
+
+All member routes are behind an account session or an API key.
 
 | Route | Returns |
 |---|---|
-| `GET /` | HTML dashboard |
-| `GET /index.json` | index of available JSON routes |
-| `GET /health` | liveness, scan age, counts, last error |
-| `GET /ready` | `200` when a fresh snapshot exists, `503` otherwise |
+| `GET /` | HTML dashboard (overview, sign up, sign in, payment, console) |
+| `GET /health` | freshness and pricing only — no scan internals |
 | `GET /rpc?limit=10` | ranked usable JSON-RPC endpoints |
 | `GET /grpc?limit=10` | ranked Yellowstone gRPC endpoints |
-| `GET /all` | both lists plus the shared scan metadata |
-| `OPTIONS *` | CORS preflight, `204` |
+| `GET /all` | both lists plus detailed scan counters |
+| `POST /ingest` | scanner publishes a snapshot (`INGEST_TOKEN`) |
+| `POST /register` `/login` | account lifecycle |
+| `POST /pay` | redeem an on-chain payment for the signed-in account |
+| `POST /admin/accounts/activate` | grant access without payment (`ADMIN_TOKEN`) |
 
 ```bash
-curl -s localhost:8090/health
-curl -s localhost:8090/rpc?limit=5
-curl -s localhost:8090/grpc?limit=5
+curl -H "Authorization: Bearer <session-or-key>"   https://solana-rpc-registry.lwhch888.workers.dev/grpc?limit=5
 ```
 
-Each row carries the measurements needed to pick an endpoint: `latency_ms` /
-`getversion_ms`, `tcp_ms`, reported `version`, and a `usable` flag.
+Each row carries the measurements needed to pick an endpoint: `latency_ms`,
+`push_lag_ms`, `tcp_ms`, reported `version`, and `stream_messages`.
 
 Filters applied so a row is only reported when it can actually be used:
 
@@ -98,37 +96,42 @@ Filters applied so a row is only reported when it can actually be used:
   `getMultipleAccounts` returns the probe account. Endpoints that only serve
   `getHealth`/`getSlot` fall into `partial_endpoints` instead.
 - **gRPC** — HTTP/2 preface accepted, `geyser.Geyser/GetVersion` returns a
-  Yellowstone version, and an anonymous `geyser.Geyser/Subscribe` is accepted.
-  A server that answers `GetVersion` but refuses the stream is not counted.
+  Yellowstone version, and an anonymous `geyser.Geyser/Subscribe` actually
+  receives stream data. A server that answers `GetVersion` but refuses the
+  stream is not counted, and endpoints requiring a token are dropped rather
+  than listed.
+- **Ordering** — ranked by `push_lag_ms` (server `createdAt` to local receive),
+  with kernel-stamped `tcp_ms` as the tie-break.
+
+Discovery sweeps the whole `getClusterNodes` address set, not just the nodes
+that advertise an RPC port — most nodes advertise no RPC yet still run gRPC.
 
 Other useful flags:
 
 ```text
 --interval 600           Seconds between scans (default 600 = 10 min)
---port 8090              HTTP bind port
---host 0.0.0.0           Bind address
---user admin             Console username (env: REGISTRY_USER)
---password-file PATH     Read the password from a mode-600 file
---password PASS          Password on argv — visible in `ps`, prefer the file
---no-auth                Disable auth (local testing only)
+--no-serve               Scan and push without binding an HTTP port
+--no-scan                Serve only the persisted snapshot
+--once                   Run one scan, print it, exit
+--push-url URL           Worker base URL to publish each snapshot to
+--push-token-file PATH   File holding the INGEST_TOKEN (mode 600)
 --grpc-ports 10000,...   Ports swept for gRPC
 --grpc-proto-dir DIR     Directory holding geyser.proto
+--push-race-seconds 10   Window for sampling push lag; 0 disables
 --probe-account PUBKEY    Account used for the getMultipleAccounts check
 --state-file PATH        Where the last snapshot is persisted
---no-scan                Serve only the persisted snapshot
---once                   Run one scan, print it, exit (no HTTP server)
 ```
 
-Password resolution order: `--password-file`, then `REGISTRY_PASSWORD`, then
-`--password`, then the built-in default. Prefer a file so the secret never
-appears in the process list.
+The last snapshot is persisted, so a restart publishes the previous results
+immediately instead of starting empty.
 
-Transport is plain HTTP, so credentials are base64-encoded rather than encrypted.
-Keep this on a trusted network, or terminate TLS in front of it.
+## Handover
 
-The last snapshot is persisted, so a restart serves the previous results
-immediately instead of starting empty. Responses include `fresh` and
-`expires_at` so consumers can detect stale data.
+Read [docs/HANDOVER.md](docs/HANDOVER.md) before changing anything — it records
+the architecture, where credentials live, the operational commands, and the
+findings that are not obvious from the code. In particular it covers why this
+scan cannot be moved to a Worker, and which mistakes have already been made
+here once.
 
 ## Useful Options
 
